@@ -19,4 +19,20 @@ $DB_NAME = 'nqzcrcmy_nimbus';
 $COOKIE_NAME = "nimbus_user";
 $COOKIE_EXPIRE = time() + (86400 * 30); // 30 days
 
+// --- SESSION STORAGE ---
+// Some cPanel accounts have a broken default session.save_path (the
+// configured directory doesn't exist / isn't writable for this account's
+// PHP version), which makes session_start() fail outright. Point sessions
+// at our own directory instead - protected from direct HTTP access by
+// the .htaccess placed alongside it.
+$session_path = __DIR__ . '/.sessions';
+if (!is_dir($session_path))
+{
+    @mkdir($session_path, 0700);
+}
+if (is_dir($session_path))
+{
+    session_save_path($session_path);
+}
+
 ?>

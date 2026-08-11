@@ -1,6 +1,11 @@
 <?php
 require_once __DIR__ . '/config.php';
 
+/* PHP session is used only to hold the current CAPTCHA code between the */
+/* time captcha.php renders it and the register form being submitted - */
+/* unrelated to the nimbus_user auth cookie */
+session_start();
+
 header('Cache-Control: no-cache, no-store, must-revalidate');
 header('Pragma: no-cache');
 header('Expires: 0');
@@ -51,8 +56,18 @@ if ($mysqli !== null && $_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action
     $username = trim($_POST['username'] ?? '');
     $password = $_POST['password'] ?? '';
     $email    = trim($_POST['email'] ?? '');
+    $captcha  = trim($_POST['captcha'] ?? '');
 
-    if (!preg_match('/^[A-Za-z0-9_]{3,32}$/', $username))
+    /* the code is single-use regardless of outcome - a fresh image is */
+    /* generated on every page load anyway */
+    $expected_captcha = $_SESSION['captcha_code'] ?? '';
+    unset($_SESSION['captcha_code']);
+
+    if ($captcha === '' || strcasecmp($captcha, $expected_captcha) !== 0)
+    {
+        $auth_error = 'Verification code did not match.';
+    }
+    elseif (!preg_match('/^[A-Za-z0-9_]{3,32}$/', $username))
     {
         $auth_error = 'Username must be 3-32 characters: letters, numbers, underscore only.';
     }
@@ -171,7 +186,70 @@ if ($mysqli !== null && isset($_COOKIE[$COOKIE_NAME]))
     }
 }
 
-if ($current_user === null)
+/* ---- change password (must already be logged in) ---- */
+$change_pw_error = '';
+$change_pw_success = isset($_GET['password_changed']);
+
+if ($current_user !== null && $mysqli !== null && $_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'change_password')
+{
+    $current_password = $_POST['current_password'] ?? '';
+    $new_password      = $_POST['new_password'] ?? '';
+    $confirm_password  = $_POST['confirm_password'] ?? '';
+
+    try
+    {
+        $stmt = $mysqli->prepare('SELECT password_hash FROM users WHERE id = ? LIMIT 1');
+        $stmt->bind_param('i', $current_user_id);
+        $stmt->execute();
+        $stmt->store_result();
+        $stmt->bind_result($db_hash);
+        $found = ($stmt->num_rows === 1) && $stmt->fetch();
+        $stmt->close();
+
+        if (!$found || !password_verify($current_password, $db_hash))
+        {
+            $change_pw_error = 'Current password is incorrect.';
+        }
+        elseif (strlen($new_password) < 8 || !preg_match('/[A-Z]/', $new_password))
+        {
+            $change_pw_error = 'New password must be at least 8 characters and include at least one capital letter.';
+        }
+        elseif ($new_password !== $confirm_password)
+        {
+            $change_pw_error = 'New passwords do not match.';
+        }
+        else
+        {
+            $new_hash = password_hash($new_password, PASSWORD_DEFAULT);
+            $update = $mysqli->prepare('UPDATE users SET password_hash = ? WHERE id = ?');
+            $update->bind_param('si', $new_hash, $current_user_id);
+            $update->execute();
+            $update->close();
+
+            /* the auth cookie embeds the password hash - it must be */
+            /* re-issued with the new hash or the user gets logged out */
+            setcookie($COOKIE_NAME, $current_user . '|' . $new_hash, [
+                'expires'  => $COOKIE_EXPIRE,
+                'path'     => '/',
+                'secure'   => true,
+                'httponly' => true,
+                'samesite' => 'Lax'
+            ]);
+
+            header('Location: index.php?password_changed=1');
+            exit;
+        }
+    }
+    catch (Throwable $e)
+    {
+        error_log('index.php: password change failed: ' . $e->getMessage());
+        $change_pw_error = 'Something went wrong. Please try again later.';
+    }
+}
+
+/* show the change-password form instead of the dashboard, either because */
+/* the user navigated to it or because a submission above just failed */
+if ($current_user !== null && (($_GET['view'] ?? '') === 'change_password' || $change_pw_error !== ''))
 {
     ?>
 <!DOCTYPE html>
@@ -269,6 +347,131 @@ if ($current_user === null)
 </head>
 <body>
     <div class="auth-card">
+        <h1>Change password</h1>
+        <?php if ($change_pw_error !== ''): ?><div class="auth-msg error"><?php echo htmlspecialchars($change_pw_error); ?></div><?php endif; ?>
+        <form method="post" action="index.php">
+            <input type="hidden" name="action" value="change_password">
+            <label for="current_password">Current password</label>
+            <input type="password" id="current_password" name="current_password" required>
+            <label for="new_password">New password</label>
+            <input type="password" id="new_password" name="new_password" minlength="8" pattern="(?=.*[A-Z]).{8,}" title="At least 8 characters, including one capital letter" required>
+            <div class="pw-rules">At least 8 characters, including one capital letter</div>
+            <label for="confirm_password">Confirm new password</label>
+            <input type="password" id="confirm_password" name="confirm_password" required>
+            <button type="submit">Change password</button>
+        </form>
+        <div class="switch"><a href="index.php">Cancel</a></div>
+    </div>
+</body>
+</html>
+    <?php
+    exit;
+}
+
+if ($current_user === null)
+{
+    ?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="icon.png" type="image/png">
+<title>Nimbus Weather Station</title>
+<style>
+    :root {
+        --bg: #0e1419;
+        --panel: #161e26;
+        --panel-edge: #232f3a;
+        --ink: #e6edf3;
+        --ink-dim: #7d8b99;
+        --accent: #4cc4d6;
+        --warn: #e0a458;
+        --sans: -apple-system, 'Segoe UI', Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+        background: var(--bg);
+        color: var(--ink);
+        font-family: var(--sans);
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 1rem;
+    }
+    .auth-card {
+        width: 100%;
+        max-width: 360px;
+        background: var(--panel);
+        border: 1px solid var(--panel-edge);
+        border-radius: 10px;
+        padding: 1.8rem;
+    }
+    .auth-card h1 {
+        font-size: 1.1rem;
+        font-weight: 600;
+        margin-bottom: 1.4rem;
+    }
+    .auth-card label {
+        display: block;
+        font-size: 0.78rem;
+        color: var(--ink-dim);
+        margin-bottom: 0.3rem;
+    }
+    .auth-card input {
+        width: 100%;
+        background: var(--bg);
+        border: 1px solid var(--panel-edge);
+        color: var(--ink);
+        border-radius: 6px;
+        padding: 0.55rem 0.65rem;
+        margin-bottom: 1rem;
+        font-size: 0.9rem;
+    }
+    .captcha-img {
+        display: block;
+        border-radius: 6px;
+        border: 1px solid var(--panel-edge);
+        margin-bottom: 0.6rem;
+    }
+    .pw-rules {
+        font-size: 0.74rem;
+        color: var(--ink-dim);
+        margin-top: -0.7rem;
+        margin-bottom: 1rem;
+    }
+    .auth-card button {
+        width: 100%;
+        background: var(--accent);
+        color: #0e1419;
+        border: none;
+        border-radius: 6px;
+        padding: 0.6rem;
+        font-size: 0.9rem;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    .auth-card .switch {
+        text-align: center;
+        margin-top: 1rem;
+        font-size: 0.82rem;
+        color: var(--ink-dim);
+    }
+    .auth-card .switch a {
+        color: var(--accent);
+        text-decoration: none;
+    }
+    .auth-msg {
+        font-size: 0.82rem;
+        margin-bottom: 1rem;
+    }
+    .auth-msg.error { color: var(--warn); }
+    .auth-msg.ok { color: var(--accent); }
+</style>
+</head>
+<body>
+    <div class="auth-card">
         <?php if ($view === 'register'): ?>
             <h1>Create account</h1>
             <?php if ($auth_error !== ''): ?><div class="auth-msg error"><?php echo htmlspecialchars($auth_error); ?></div><?php endif; ?>
@@ -281,6 +484,9 @@ if ($current_user === null)
                 <label for="password">Password</label>
                 <input type="password" id="password" name="password" minlength="8" pattern="(?=.*[A-Z]).{8,}" title="At least 8 characters, including one capital letter" required>
                 <div class="pw-rules">At least 8 characters, including one capital letter</div>
+                <label for="captcha">Verification code</label>
+                <img class="captcha-img" src="captcha.php?<?php echo time(); ?>" alt="Verification code" width="140" height="50">
+                <input type="text" id="captcha" name="captcha" maxlength="8" autocomplete="off" required>
                 <button type="submit">Create account</button>
             </form>
             <div class="switch">Already have an account? <a href="index.php?view=login">Log in</a></div>
@@ -452,6 +658,15 @@ if ($mysqli !== null)
         border-color: var(--accent);
     }
 
+    .banner-ok {
+        width: 100%;
+        max-width: 760px;
+        font-size: 0.82rem;
+        color: var(--accent);
+        margin-top: -1rem;
+        margin-bottom: 1.2rem;
+    }
+
     .grid {
         width: 100%;
         max-width: 760px;
@@ -616,9 +831,14 @@ if ($mysqli !== null)
     <div class="station-head">
         <h1>Nimbus Weather Station</h1>
         <span class="right">
+            <a class="logout" href="index.php?view=change_password">Change password</a>
             <a class="logout" href="index.php?logout=1">Log out</a>
         </span>
     </div>
+
+    <?php if ($change_pw_success): ?>
+    <div class="banner-ok">Password changed.</div>
+    <?php endif; ?>
 
     <div class="grid">
         <div class="reading">
