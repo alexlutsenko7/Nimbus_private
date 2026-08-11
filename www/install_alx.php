@@ -4,7 +4,7 @@ require_once "config.php";
 
 
 
-echo "<h1>Capsicum Database Installer</h1>";
+echo "<h1>Nimbus Database Installer</h1>";
 
 
 
@@ -78,11 +78,7 @@ CREATE TABLE users (
 
     email VARCHAR(255) NOT NULL,
 
-    phone VARCHAR(32) NULL,
-
     confirmed TINYINT(1) NOT NULL DEFAULT 0,
-
-    confirmed_phone TINYINT(1) NOT NULL DEFAULT 0,
 
     confirm_token VARCHAR(64) DEFAULT NULL,
 
@@ -116,29 +112,11 @@ CREATE TABLE devices (
 
     id INT AUTO_INCREMENT PRIMARY KEY,
 
-    user_id INT NOT NULL,
-
-    device_name VARCHAR(100) NOT NULL,
+    user_id INT,
 
     device_number BINARY(9) NOT NULL UNIQUE,
 
-    status TINYINT(1) NOT NULL DEFAULT 0,
-
-    voltage FLOAT NULL DEFAULT NULL,
-
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    alert_old_sent TINYINT(1) NOT NULL DEFAULT 0,
-
-    signal_strength VARCHAR(512) NOT NULL,
-
-    device_type INT NOT NULL,
-
-    connected_to VARCHAR(512) NOT NULL,
-
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 
 ) ENGINE=InnoDB;
 
