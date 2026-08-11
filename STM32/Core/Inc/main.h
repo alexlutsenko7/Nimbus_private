@@ -89,24 +89,80 @@ void Error_Handler(void);
 #define ADC_TIMEOUT_MS          1000u
 #define ADC_INVALID_RESULT      0u
 
-#define DEBUG_MODE				0
+#define DEBUG_MODE        0
 
+/*
+ * ---------------------------------------------------------------------------
+ * Wake-up / IWDG timing
+ * ---------------------------------------------------------------------------
+ * No RTC wakeup timer is configured in this project (see MX_RTC_Init) -
+ * PWR_WAKEUP_PIN1 only wakes the part on an external pin edge (the setup
+ * button). The periodic wake from STANDBY is therefore driven entirely by
+ * the IWDG: it keeps counting down off LSI while the MCU is in STANDBY, and
+ * when it reaches 0 it forces a full chip reset - which functions as
+ * "waking up" (see watchdog_set_sleep() / SleepTight() in main.c). There is
+ * no separate low-power timer involved; the watchdog timeout below IS the
+ * wake period, so changing it changes how often the station reports.
+ *
+ * IWDG timeout formula (STM32L0, 12-bit down counter):
+ *
+ *     T [s] = (Reload + 1) x PrescalerDivider / LSI_Hz
+ *
+ * PrescalerDivider is 4 x 2^N for IWDG_PRESCALER_4..256, i.e. one of
+ * {4, 8, 16, 32, 64, 128, 256}. LSI on STM32L0 is nominally ~37 kHz but is
+ * NOT calibrated by default and can drift roughly +/-30-50% with
+ * temperature/voltage - treat every timing below as approximate, not exact.
+ *
+ * Two independent profiles get loaded into the same IWDG peripheral at
+ * different points in the code (watchdog_set_active() / watchdog_set_sleep()
+ * in main.c), because they serve different purposes:
+ *
+ *   _ACTIVE - armed while the MCU is awake doing real work (BME280 I2C
+ *             reads, the UART handshake with the ESP32 in ConfirmComm).
+ *             Kept SHORT so a genuine hang (e.g. a HAL_I2C_* call blocking
+ *             forever on a wedged bus, since those are called with
+ *             HAL_MAX_DELAY) is caught and the part resets quickly instead
+ *             of sitting dead until the battery runs out.
+ *             Reload=4095, Prescaler=32 -> (4096 x 32) / 37000 ~= 3.5s.
+ *
+ *   _SLEEP  - armed just before entering STANDBY. Kept LONG, and its expiry
+ *             *is* the wake-up mechanism described above.
+ *             Reload=4095, Prescaler=128 -> (4096 x 128) / 37000 ~= 14.2s.
+ *
+ * A single _SLEEP expiry is NOT the full reporting interval by itself,
+ * though: on every wake, WakeReasonChk() (main.c) checks a counter kept in
+ * RTC backup register RTC_BKP_DR0 - this survives STANDBY, unlike ordinary
+ * RAM. The counter walks 1, 2, 3, ... up to TIMEOUT_MASK (defined further
+ * below), then wraps back to 0; only on the wake where it reads 0 does the
+ * device actually power up the sensor and the ESP32 and report a
+ * measurement (GetMeasurmentThenUpdate()) - every other wake just re-arms
+ * _SLEEP and goes straight back to STANDBY. So the real formula is:
+ *
+ *     reporting period ~= (TIMEOUT_MASK + 1) x _SLEEP timeout
+ *
+ * With TIMEOUT_MASK = 0x3F (64) and the _SLEEP numbers above:
+ *
+ *     64 x 14.2s ~= 906s ~= 15.1 minutes
+ *
+ * DEBUG_MODE=1 shrinks everything at once (8x prescaler for both profiles,
+ * TIMEOUT_MASK=0xF) so a full sense-and-report cycle takes ~14s on the bench
+ * instead of ~15 minutes, so you're not waiting to see whether an upload
+ * works while iterating on the code.
+ * ---------------------------------------------------------------------------
+ */
 #if DEBUG_MODE == 1
 #define IWDG_PRESCALER_ACTIVE   IWDG_PRESCALER_8
 #else
 #define IWDG_PRESCALER_ACTIVE   IWDG_PRESCALER_32
 #endif
 #define IWDG_RELOAD_ACTIVE      4095u
-/* 32 x 4096 / 37000 = 5.9s active timeout */
 
 #if DEBUG_MODE == 1
 #define IWDG_PRESCALER_SLEEP    IWDG_PRESCALER_8
 #else
-#define IWDG_PRESCALER_SLEEP    IWDG_PRESCALER_32
+#define IWDG_PRESCALER_SLEEP    IWDG_PRESCALER_128
 #endif
-
 #define IWDG_RELOAD_SLEEP       4095u
-/* 256 x 4096 / 37000 = 28.3s sleep timeout */
 
 #define RETRY_INIT_CNT			5
 #define INIT_DELAY				200

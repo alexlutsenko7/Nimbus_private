@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <esp_mac.h>
 
 /* Pin definitions */
 #define RX_PIN              D7
@@ -21,8 +22,18 @@
 #define TEMP_SCALE          100
 #define HUM_SCALE           1000
 
+/* Device identifier sent to the server: 6 bytes of the WiFi station MAC   */
+/* followed by the last 3 bytes of the Bluetooth MAC (the first 3 bytes   */
+/* of the BT MAC are the same OUI as the WiFi MAC on this chip, so only   */
+/* the differing tail is worth including) - 9 bytes total, hex-encoded.   */
+#define DEVICE_MAC_WIFI_LEN 6
+#define DEVICE_MAC_BT_LEN   3
+#define DEVICE_MAC_LEN      (DEVICE_MAC_WIFI_LEN + DEVICE_MAC_BT_LEN)
+#define DEVICE_MAC_HEX_LEN  (DEVICE_MAC_LEN * 2)
+
 /* Server URL for data upload */
 //#define DATA_URL            "https://alxlabs.ca/books/env_sensor/web/data.php"
+//#define DATA_URL            "https://alxlabs.ca/books/env_sensor/web/update_alx_setup.php"
 #define DATA_URL            "https://alxlabs.ca/books/env_sensor/web/update_alx.php"
 /* WiFi connection timeout for data upload */
 #define WIFI_DATA_TIMEOUT   15000u
@@ -236,16 +247,48 @@ bool wifi_connect_stored(void)
     return false;
 }
 
+/* Build the device identifier: WiFi station MAC (6 bytes) followed by the */
+/* last 3 bytes of the Bluetooth MAC, hex-encoded (uppercase, no          */
+/* separators) into str_hex_out, which must be at least                  */
+/* DEVICE_MAC_HEX_LEN+1 bytes long */
+void get_device_mac_hex(char *str_hex_out)
+{
+    static const char c_hex_digits[] = "0123456789ABCDEF";
+    uint8_t ui8_mac_wifi[DEVICE_MAC_WIFI_LEN];
+    uint8_t ui8_mac_bt[6];
+    uint8_t ui8_mac_combined[DEVICE_MAC_LEN];
+    int32_t i32_idx;
+
+    /* WiFi station MAC is the chip's base MAC address */
+    WiFi.macAddress(ui8_mac_wifi);
+    /* Bluetooth MAC is derived from the base MAC with a small offset */
+    esp_read_mac(ui8_mac_bt, ESP_MAC_BT);
+
+    memcpy(ui8_mac_combined, ui8_mac_wifi, DEVICE_MAC_WIFI_LEN);
+    memcpy(ui8_mac_combined + DEVICE_MAC_WIFI_LEN,
+           ui8_mac_bt + (sizeof(ui8_mac_bt) - DEVICE_MAC_BT_LEN),
+           DEVICE_MAC_BT_LEN);
+
+    for (i32_idx = 0; i32_idx < DEVICE_MAC_LEN; i32_idx++)
+    {
+        str_hex_out[i32_idx * 2]     = c_hex_digits[(ui8_mac_combined[i32_idx] >> 4) & 0x0F];
+        str_hex_out[i32_idx * 2 + 1] = c_hex_digits[ui8_mac_combined[i32_idx] & 0x0F];
+    }
+    str_hex_out[DEVICE_MAC_HEX_LEN] = '\0';
+}
+
 /* Send measurement data to the server via HTTPS GET */
-/* URL format: data.php?T2334H6722P98823B3294 */
+/* URL format: update_alx_setup.php?T2334H6722P98823B3294MD83BDA75F32C011 */
 void send_to_server(int32_t i32_temperature, int32_t i32_pressure, int32_t i32_humidity, int32_t i32_battery)
 {
     String str_url;
     int32_t i32_response_code;
     int32_t i32_attempt;
+    char str_mac_hex[DEVICE_MAC_HEX_LEN + 1];
 
     /* Initialise variables */
     i32_response_code = 0;
+    get_device_mac_hex(str_mac_hex);
 
     /* Build the URL with measurement data as query parameter */
     str_url = DATA_URL;
@@ -257,6 +300,8 @@ void send_to_server(int32_t i32_temperature, int32_t i32_pressure, int32_t i32_h
     str_url += String(i32_pressure);
     str_url += "B";
     str_url += String(i32_battery);
+    str_url += "M";
+    str_url += str_mac_hex;
 
     /* Retry the upload up to DATA_UPLOAD_RETRY_COUNT times - transient */
     /* failures like "connection refused" often succeed on the next try */

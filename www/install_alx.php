@@ -116,6 +116,8 @@ CREATE TABLE devices (
 
     device_number BINARY(9) NOT NULL UNIQUE,
 
+    last_reading JSON DEFAULT NULL,
+
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 
 ) ENGINE=InnoDB;
