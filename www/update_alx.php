@@ -35,7 +35,7 @@ $record = array(
     'humidity'    => $humidity,
     'pressure'   => $pressure,
     'battery'    => $battery,
-    'timestamp'  => date('Y-m-d H:i:s'),
+    'timestamp'  => gmdate('Y-m-d H:i:s'),
     'ip'         => $_SERVER['REMOTE_ADDR']
 );
 
