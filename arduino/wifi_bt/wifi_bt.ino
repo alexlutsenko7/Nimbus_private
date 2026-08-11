@@ -37,6 +37,9 @@
 #define DATA_URL            "https://alxlabs.ca/books/env_sensor/web/update_alx.php"
 /* WiFi connection timeout for data upload */
 #define WIFI_DATA_TIMEOUT   15000u
+/* Server URL used once, right after BLE setup connects to WiFi, to link */
+/* this device to whichever dashboard account the phone was logged into */
+#define CLAIM_URL            "https://alxlabs.ca/books/env_sensor/web/claim_device.php"
 
 /* BLE UUIDs for the GATT service and characteristics */
 #define SERVICE_UUID          "12345678-1234-1234-1234-123456789ABC"
@@ -44,6 +47,9 @@
 #define CHAR_WIFILIST_UUID    "12345678-1234-1234-1234-123456789ABE"
 #define CHAR_CREDENTIAL_UUID  "12345678-1234-1234-1234-123456789ABF"
 #define CHAR_STATUS_UUID      "12345678-1234-1234-1234-123456789AC0"
+/* User credential characteristic UUID - the app writes "username|password_hash" */
+/* here during BLE setup, if the phone is logged into the dashboard */
+#define CHAR_USER_UUID        "12345678-1234-1234-1234-123456789AC1"
 
 /* BLE device name visible to scanning phones */
 #define BLE_DEVICE_NAME     "Weather station"
@@ -74,6 +80,9 @@ BLECharacteristic *gp_char_wifilist;
 BLECharacteristic *gp_char_credential;
 /* Pointer to the status characteristic - esp sends status notifications here */
 BLECharacteristic *gp_char_status;
+/* Pointer to the user credential characteristic - phone writes */
+/* username|password_hash here, if logged into the dashboard */
+BLECharacteristic *gp_char_user;
 /* Flag indicating whether BLE server is active */
 bool g_b_ble_active;
 /* Flag indicating whether a phone is connected via BLE */
@@ -86,6 +95,12 @@ bool g_b_credential_received = false;
 String g_str_received_ssid;
 /* Received password from the phone */
 String g_str_received_pass;
+/* Flag set by user credential callback when phone sends a dashboard login */
+bool g_b_user_credential_received = false;
+/* Received dashboard username from the phone */
+String g_str_received_username;
+/* Received dashboard password hash from the phone */
+String g_str_received_password_hash;
 
 /* Preferences object for reading and writing flash storage */
 Preferences g_preferences;
@@ -167,6 +182,38 @@ class CredentialCallbacks : public BLECharacteristicCallbacks
         {
             /* Notify the phone that the format was invalid */
             send_status("ERROR:Invalid credential format");
+        }
+    }
+};
+
+/* User credential characteristic callback - called when the phone writes */
+/* username|password_hash (only sent if the phone is logged into the */
+/* dashboard). Silently ignored if malformed - the device just stays */
+/* unclaimed, same as if nothing was written at all */
+class UserCredentialCallbacks : public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *pCharacteristic)
+    {
+        String str_value;
+        int32_t i32_separator;
+
+        /* Read the value written by the phone */
+        str_value = pCharacteristic->getValue().c_str();
+        str_value.trim();
+
+        /* Find the pipe separator between username and password hash */
+        i32_separator = str_value.indexOf('|');
+
+        /* Validate that the separator exists and is not at position 0 */
+        if (i32_separator > 0)
+        {
+            /* Extract username (everything before the pipe) */
+            g_str_received_username = str_value.substring(0, i32_separator);
+            /* Extract password hash (everything after the pipe) */
+            g_str_received_password_hash = str_value.substring(i32_separator + 1);
+            g_b_user_credential_received = true;
+
+            Serial.printf("User credential received for: %s\r\n", g_str_received_username.c_str());
         }
     }
 };
@@ -275,6 +322,61 @@ void get_device_mac_hex(char *str_hex_out)
         str_hex_out[i32_idx * 2 + 1] = c_hex_digits[ui8_mac_combined[i32_idx] & 0x0F];
     }
     str_hex_out[DEVICE_MAC_HEX_LEN] = '\0';
+}
+
+/* Sends this device's MAC together with the dashboard username/password */
+/* hash received over BLE (if any) to claim_device.php, linking the */
+/* device to that account. Called once, right after WiFi connects during */
+/* BLE setup. No-op if the phone never sent a user credential - the */
+/* device just stays unclaimed (user_id=0) */
+void claim_device(void)
+{
+    String str_url;
+    char str_mac_hex[DEVICE_MAC_HEX_LEN + 1];
+    int32_t i32_response_code;
+
+    if (!g_b_user_credential_received)
+    {
+        return;
+    }
+
+    get_device_mac_hex(str_mac_hex);
+
+    str_url = CLAIM_URL;
+    str_url += "?mac=";
+    str_url += str_mac_hex;
+    str_url += "&username=";
+    str_url += g_str_received_username;
+    str_url += "&hash=";
+    str_url += g_str_received_password_hash;
+
+    WiFiClientSecure wifi_client;
+    HTTPClient http_client;
+
+    /* Skip certificate verification for now */
+    /* Production should use a root CA certificate */
+    wifi_client.setInsecure();
+    wifi_client.setHandshakeTimeout(DATA_UPLOAD_TIMEOUT_MS / 1000u);
+
+    if (http_client.begin(wifi_client, str_url))
+    {
+        http_client.setConnectTimeout(DATA_UPLOAD_TIMEOUT_MS);
+        http_client.setTimeout(DATA_UPLOAD_TIMEOUT_MS);
+        http_client.addHeader("User-Agent", "Mozilla/5.0 (NimbusWeatherStation)");
+        http_client.addHeader("Accept", "*/*");
+
+        i32_response_code = http_client.GET();
+        Serial.printf("Claim device response: %ld\r\n", i32_response_code);
+        Serial.printf("Claim response body: %s\r\n", http_client.getString().c_str());
+
+        http_client.end();
+    }
+    else
+    {
+        Serial.printf("Claim device: failed to begin HTTPS connection\r\n");
+    }
+
+    g_b_user_credential_received = false;
 }
 
 /* Send measurement data to the server via HTTPS GET */
@@ -392,6 +494,7 @@ void ble_setup(void)
     g_b_client_connected = false;
     g_b_scan_requested = false;
     g_b_credential_received = false;
+    g_b_user_credential_received = false;
 
     /* Initialise the BLE stack with the device name */
     BLEDevice::init(BLE_DEVICE_NAME);
@@ -426,6 +529,15 @@ void ble_setup(void)
     );
     /* Register the credential callback */
     gp_char_credential->setCallbacks(new CredentialCallbacks());
+
+    /* Create the user credential characteristic - phone writes */
+    /* username|password_hash here, if logged into the dashboard */
+    gp_char_user = p_service->createCharacteristic(
+        CHAR_USER_UUID,
+        BLECharacteristic::PROPERTY_WRITE
+    );
+    /* Register the user credential callback */
+    gp_char_user->setCallbacks(new UserCredentialCallbacks());
 
     /* Create the status characteristic - esp sends status notifications here */
     gp_char_status = p_service->createCharacteristic(
@@ -612,6 +724,10 @@ void wifi_connect_and_store(void)
     /* Notify the phone that connection was successful */
     send_status("CONNECT_OK");
 
+    /* While WiFi is still up, claim this device for whichever dashboard */
+    /* account the phone was logged into (no-op if none was received) */
+    claim_device();
+
     /* Disconnect WiFi - the next measurement cycle will reconnect */
     WiFi.disconnect();
 }
@@ -680,9 +796,12 @@ void setup()
     g_b_client_connected = false;
     g_b_scan_requested = false;
     g_b_credential_received = false;
+    g_b_user_credential_received = false;
     /* Clear any stale credential strings */
     g_str_received_ssid = "";
     g_str_received_pass = "";
+    g_str_received_username = "";
+    g_str_received_password_hash = "";
 
     /* Init for GPIO to signal the readiness to STM32 */
     pinMode(READY_PIN, OUTPUT);

@@ -116,8 +116,14 @@ class MainActivity : ComponentActivity() {
     private val credentialUuid = UUID.fromString("12345678-1234-1234-1234-123456789ABF")
     /* Status characteristic UUID - the ESP32 sends status updates here as notifications */
     private val statusUuid = UUID.fromString("12345678-1234-1234-1234-123456789AC0")
+    /* User credential characteristic UUID - the app writes "username|password_hash" */
+    /* here so the device can claim itself for the logged-in dashboard account */
+    private val credUserUuid = UUID.fromString("12345678-1234-1234-1234-123456789AC1")
     /* Client Characteristic Configuration Descriptor UUID - standard BLE descriptor for enabling notifications */
     private val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+    /* Name of the dashboard's login cookie - must match $COOKIE_NAME in config.php */
+    private val dashboardCookieName = "nimbus_user"
 
     /* Tracks which screen is currently visible: "dashboard", "scan", or "wifi_select" */
     private val currentScreen = mutableStateOf("dashboard")
@@ -151,6 +157,10 @@ class MainActivity : ComponentActivity() {
     /* Status message shown on the WiFi selection screen */
     /* Updated by handleStatusUpdate when the ESP32 sends notifications */
     private val provisioningStatus = mutableStateOf("")
+
+    /* WiFi credential (ssid, password) waiting to be written once the */
+    /* user-credential write ahead of it finishes - see onCharacteristicWrite */
+    private var pendingWifiCredential: Pair<String, String>? = null
 
     /* Controls visibility of the "No internet connection" overlay */
     /* Set true by the WebView error handler, cleared when a page loads */
@@ -692,6 +702,32 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+
+        /*
+         * Called when a characteristic write completes. BLE only allows one
+         * pending GATT operation at a time, so the user-credential write in
+         * sendCredentials() chains the WiFi-credential write off this
+         * callback instead of a fixed delay - a fixed delay raced with the
+         * write and silently dropped it.
+         */
+        @Deprecated("Deprecated in API 33")
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.e("BLE_GATT", "Write failed for ${characteristic.uuid}, status=$status")
+            }
+
+            if (characteristic.uuid == credUserUuid) {
+                val pending = pendingWifiCredential
+                pendingWifiCredential = null
+                if (pending != null) {
+                    writeWifiCredential(pending.first, pending.second)
+                }
+            }
+        }
     }
 
     /*
@@ -720,16 +756,39 @@ class MainActivity : ComponentActivity() {
     /*
      * Sends WiFi credentials to the ESP32 via the credential characteristic.
      * Payload format: "SSID|password"
+     *
+     * If a dashboard user credential is available, that write is sent
+     * first and this one is queued to follow once it completes (BLE only
+     * allows one pending GATT operation at a time - see
+     * onCharacteristicWrite in gattCallback) so the device can claim
+     * itself for that account once WiFi setup finishes on its end.
      */
     @SuppressLint("MissingPermission")
     private fun sendCredentials(ssid: String, password: String) {
+        /* Update UI to show we are sending */
+        provisioningStatus.value = "Sending credentials..."
+
+        if (trySendUserCredential()) {
+            /* Wait for onCharacteristicWrite(credUserUuid) to fire before */
+            /* sending this - sending both back-to-back drops the second */
+            /* write silently since BLE only allows one pending op */
+            pendingWifiCredential = Pair(ssid, password)
+        } else {
+            writeWifiCredential(ssid, password)
+        }
+    }
+
+    /*
+     * Actually writes "SSID|password" to the credential characteristic.
+     * Split out from sendCredentials() so it can be called either
+     * immediately or after the user-credential write completes.
+     */
+    @SuppressLint("MissingPermission")
+    private fun writeWifiCredential(ssid: String, password: String) {
         /* Get the GATT service - return if not connected */
         val service = bluetoothGatt?.getService(serviceUuid) ?: return
         /* Get the credential characteristic */
         val credentialChar = service.getCharacteristic(credentialUuid) ?: return
-
-        /* Update UI to show we are sending */
-        provisioningStatus.value = "Sending credentials..."
 
         /* Build the pipe-delimited payload */
         val payload = "$ssid|$password"
@@ -739,6 +798,53 @@ class MainActivity : ComponentActivity() {
         bluetoothGatt?.writeCharacteristic(credentialChar)
 
         Log.d("BLE_GATT", "Credentials sent for SSID: $ssid")
+    }
+
+    /*
+     * Reads the dashboard's login cookie (set by index.php after a
+     * successful web login) via Android's CookieManager and forwards
+     * "username|password_hash" to the ESP32 via the user credential
+     * characteristic. If the phone isn't logged into the dashboard, this
+     * is skipped entirely and the device stays unclaimed (user_id=0) -
+     * the user can claim it later by logging in and re-running setup.
+     * Returns true if a write was actually issued, so the caller knows
+     * whether to wait for it to complete before writing anything else.
+     */
+    @SuppressLint("MissingPermission")
+    private fun trySendUserCredential(): Boolean {
+        /* Get the GATT service - bail out if not connected */
+        val service = bluetoothGatt?.getService(serviceUuid) ?: return false
+        /* Get the user credential characteristic */
+        val userChar = service.getCharacteristic(credUserUuid) ?: return false
+
+        /* Read the raw Cookie header value for the dashboard URL */
+        val cookieHeader = android.webkit.CookieManager.getInstance().getCookie(dashboardUrl)
+        /* Find the nimbus_user cookie among any others and pull its value */
+        val rawValue = cookieHeader
+            ?.split("; ")
+            ?.map { it.split("=", limit = 2) }
+            ?.firstOrNull { it.size == 2 && it[0] == dashboardCookieName }
+            ?.get(1)
+
+        if (rawValue == null) {
+            Log.w("BLE_GATT", "Not logged into dashboard - device will stay unclaimed")
+            Toast.makeText(
+                this,
+                "Log in to the dashboard first to link this sensor to your account",
+                Toast.LENGTH_LONG
+            ).show()
+            return false
+        }
+
+        /* Cookie values are URL-encoded by PHP's setcookie() - decode back */
+        /* to the raw "username|password_hash" the ESP32/server expect */
+        val payload = java.net.URLDecoder.decode(rawValue, "UTF-8")
+
+        userChar.value = payload.toByteArray()
+        bluetoothGatt?.writeCharacteristic(userChar)
+
+        Log.d("BLE_GATT", "User credential sent")
+        return true
     }
 
     /*

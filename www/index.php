@@ -573,9 +573,40 @@ if ($mysqli !== null)
     @media (max-width: 520px) {
         .grid {
             grid-template-columns: 1fr;
+            gap: 0.6rem;
+        }
+        .station-head h1 {
+            font-size: 1rem;
+        }
+        .reading {
+            padding: 0.9rem 1rem;
+        }
+        .reading .label {
+            font-size: 0.64rem;
         }
         .reading .value {
-            font-size: 2.1rem;
+            font-size: 1.7rem;
+        }
+        .reading .unit {
+            font-size: 0.82rem;
+        }
+        .devices {
+            padding: 0.8rem 1rem;
+        }
+        .devices-title {
+            font-size: 0.64rem;
+        }
+        .no-devices {
+            font-size: 0.78rem;
+        }
+        .device-row {
+            font-size: 0.76rem;
+        }
+        .device-created {
+            font-size: 0.64rem;
+        }
+        .footer {
+            font-size: 0.66rem;
         }
     }
 </style>
