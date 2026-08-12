@@ -54,6 +54,12 @@ $mysqli = null;
 try
 {
     $mysqli = new mysqli($DB_HOST, $DB_USER, $DB_PASS, $DB_NAME);
+    /* devices.created_at is a TIMESTAMP column - MySQL converts it through */
+    /* the session's time_zone on every read (not just NOW()/literal writes), */
+    /* so without pinning this, SELECT hands back a value already shifted by */
+    /* the DB server's default zone, which the UTC->America/Toronto */
+    /* conversion below would then shift again */
+    $mysqli->query("SET time_zone = '+00:00'");
 }
 catch (Throwable $e)
 {

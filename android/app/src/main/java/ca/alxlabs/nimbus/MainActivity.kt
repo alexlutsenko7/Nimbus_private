@@ -172,6 +172,14 @@ class MainActivity : ComponentActivity() {
     /* user-credential write ahead of it finishes - see onCharacteristicWrite */
     private var pendingWifiCredential: Pair<String, String>? = null
 
+    /* Whether this setup session actually sent a dashboard user credential */
+    /* (i.e. the phone was logged in), set by sendCredentials(). If true, */
+    /* CONNECT_OK alone is NOT the final outcome - a claim attempt is still */
+    /* coming and handleStatusUpdate must wait for CLAIM_OK/CLAIM_FAILED */
+    /* before declaring success, otherwise a claim that fails right after */
+    /* WiFi joins (e.g. a network blip) gets reported as a success */
+    private var claimExpected = false
+
     /* Controls visibility of the "No internet connection" overlay */
     /* Set true by the WebView error handler, cleared when a page loads */
     private val showNoInternet = mutableStateOf(false)
@@ -804,7 +812,8 @@ class MainActivity : ComponentActivity() {
         /* Update UI to show we are sending */
         provisioningStatus.value = "Sending credentials..."
 
-        if (trySendUserCredential()) {
+        claimExpected = trySendUserCredential()
+        if (claimExpected) {
             /* Wait for onCharacteristicWrite(credUserUuid) to fire before */
             /* sending this - sending both back-to-back drops the second */
             /* write silently since BLE only allows one pending op */
@@ -940,12 +949,25 @@ class MainActivity : ComponentActivity() {
             status == "CONNECTING" -> {
                 provisioningStatus.value = "Connecting to WiFi..."
             }
-            /* ESP32 connected and stored credentials */
+            /* ESP32 joined WiFi and stored credentials. If this session never */
+            /* sent a user credential (phone wasn't logged in), there's no */
+            /* claim attempt coming - this IS the final outcome. Otherwise a */
+            /* claim attempt is still in flight and CLAIM_OK/CLAIM_FAILED */
+            /* below decides the real outcome - showing success here too */
+            /* would be a lie if that claim then fails from a network blip */
             status == "CONNECT_OK" -> {
-                cancelWifiConnectTimeout()
-                provisioningStatus.value = "WiFi connected! Credentials saved."
-                /* Show success toast */
-                Toast.makeText(this, "Sensor configured successfully!", Toast.LENGTH_LONG).show()
+                if (claimExpected) {
+                    /* Restart the watchdog with a fresh window for the claim */
+                    /* step - the original one was budgeted for the WiFi */
+                    /* connect retries alone and could otherwise expire while */
+                    /* claim_device()'s own retries are still in flight */
+                    startWifiConnectTimeout()
+                    provisioningStatus.value = "WiFi connected, linking sensor to your account..."
+                } else {
+                    cancelWifiConnectTimeout()
+                    provisioningStatus.value = "WiFi connected! Credentials saved."
+                    Toast.makeText(this, "Sensor configured successfully!", Toast.LENGTH_LONG).show()
+                }
             }
             /* ESP32 failed to connect */
             status == "CONNECT_FAIL" -> {
@@ -954,12 +976,20 @@ class MainActivity : ComponentActivity() {
                 /* Show failure toast */
                 Toast.makeText(this, "WiFi connection failed", Toast.LENGTH_LONG).show()
             }
+            /* WiFi joined AND the sensor was successfully linked to the */
+            /* dashboard account - the actual final success signal when a */
+            /* claim was expected */
+            status == "CLAIM_OK" -> {
+                cancelWifiConnectTimeout()
+                provisioningStatus.value = "Success! Sensor linked to your account."
+                Toast.makeText(this, "Sensor configured successfully!", Toast.LENGTH_LONG).show()
+            }
             /* ESP32 joined WiFi (CONNECT_OK already fired) but couldn't */
             /* reach the server to link this sensor to the account */
             status == "CLAIM_FAILED" -> {
                 cancelWifiConnectTimeout()
-                provisioningStatus.value = "WiFi connection problems"
-                Toast.makeText(this, "WiFi connection problems", Toast.LENGTH_LONG).show()
+                provisioningStatus.value = "WiFi connected, but linking to your account failed"
+                Toast.makeText(this, "WiFi connected, but linking to your account failed", Toast.LENGTH_LONG).show()
             }
             /* Any error from the ESP32 */
             status.startsWith("ERROR") -> {

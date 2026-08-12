@@ -33,14 +33,19 @@ $registered = false;
 try
 {
     $mysqli = new mysqli($DB_HOST, $DB_USER, $DB_PASS, $DB_NAME);
+    /* created_at is a TIMESTAMP column - see the same note in claim_device.php */
+    $mysqli->query("SET time_zone = '+00:00'");
 
     /* device_number is UNIQUE, so INSERT IGNORE atomically does nothing if */
     /* a row for this device already exists - no separate SELECT needed, */
     /* and no race condition between the check and the insert */
+    /* Explicit PHP-generated UTC value instead of NOW() - see the same */
+    /* note in claim_device.php */
+    $created_at_utc = gmdate('Y-m-d H:i:s');
     $insert = $mysqli->prepare(
-        'INSERT IGNORE INTO devices (user_id, device_number, created_at) VALUES (0, ?, NOW())'
+        'INSERT IGNORE INTO devices (user_id, device_number, created_at) VALUES (0, ?, ?)'
     );
-    $insert->bind_param('s', $mac_binary);
+    $insert->bind_param('ss', $mac_binary, $created_at_utc);
     $insert->execute();
     $insert->close();
 

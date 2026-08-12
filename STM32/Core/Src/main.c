@@ -541,7 +541,7 @@ void ConfirmComm(bool bState, uint32_t ui32CommDelay, uint8_t *ui8Data)
 		watchdog_reset();
 		/* Transmit the weather data in loop until ESP32 gets it */
 		printf ("%s", ui8Data);
-		/* Set the flag if ESP32 is ok */
+		/* Set the flag if ESP32 is ok _OR_ if button is pressed during the process */
 		if (HAL_GPIO_ReadPin(GPIOA, ESP_FEEDBACK_Pin) == bState || (HAL_GetTick() > HAL_BUTTON_TIMEOUT && HAL_GPIO_ReadPin(GPIOA, SetupButton_Pin)))
 		{
 			bClean = true;

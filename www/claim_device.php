@@ -30,6 +30,11 @@ $claimed = false;
 try
 {
     $mysqli = new mysqli($DB_HOST, $DB_USER, $DB_PASS, $DB_NAME);
+    /* created_at is a TIMESTAMP column - MySQL reinterprets any value */
+    /* written to it (even a literal gmdate() string, not just NOW()) */
+    /* through the session's time_zone, so pin it to UTC or the value */
+    /* below still ends up shifted */
+    $mysqli->query("SET time_zone = '+00:00'");
 
     $stmt = $mysqli->prepare('SELECT id, password_hash FROM users WHERE username = ? LIMIT 1');
     $stmt->bind_param('s', $username);
@@ -41,8 +46,14 @@ try
 
     if ($found && hash_equals($db_hash, $hash))
     {
-        $update = $mysqli->prepare('UPDATE devices SET user_id = ? WHERE device_number = ?');
-        $update->bind_param('is', $user_id, $mac_binary);
+        /* created_at now doubles as "last claimed at" - bind an explicit */
+        /* PHP-generated UTC value (same as update_alx.php's gmdate() for */
+        /* last_reading) rather than MySQL's NOW(), which is stored/read in */
+        /* the DB session's time_zone and would drift from the UTC that */
+        /* index.php assumes when converting it for display */
+        $claimed_at_utc = gmdate('Y-m-d H:i:s');
+        $update = $mysqli->prepare('UPDATE devices SET user_id = ?, created_at = ? WHERE device_number = ?');
+        $update->bind_param('iss', $user_id, $claimed_at_utc, $mac_binary);
         $update->execute();
         $update->close();
 

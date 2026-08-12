@@ -32,6 +32,9 @@
 #define DEVICE_MAC_LEN      (DEVICE_MAC_WIFI_LEN + DEVICE_MAC_BT_LEN)
 #define DEVICE_MAC_HEX_LEN  (DEVICE_MAC_LEN * 2)
 
+/* Hostname shared by DATA_URL and CLAIM_URL below, used to log which */
+/* backend IP DNS handed us on each upload - see log_resolved_server_ip() */
+#define SERVER_HOST         "alxlabs.ca"
 /* Server URL for data upload */
 #define DATA_URL            "https://alxlabs.ca/books/env_sensor/web/update_alx.php"
 /* WiFi connection timeout for data upload */
@@ -231,6 +234,81 @@ class UserCredentialCallbacks : public BLECharacteristicCallbacks
     }
 };
 
+/* Translate an esp_wifi disconnect reason code (WiFiEventInfo_t.wifi_sta_disconnected.reason) */
+/* into a human-readable string, for the handful of reasons that actually */
+/* show up in practice - full list is in esp_wifi_types.h (wifi_err_reason_t) */
+const char *wifi_disconnect_reason_str(uint8_t ui8_reason)
+{
+    switch (ui8_reason)
+    {
+        case 2:   return "AUTH_EXPIRE";
+        case 3:   return "AUTH_LEAVE";
+        case 4:   return "ASSOC_EXPIRE";
+        case 5:   return "ASSOC_TOOMANY - AP is full";
+        case 6:   return "NOT_AUTHED";
+        case 7:   return "NOT_ASSOCED";
+        case 8:   return "ASSOC_LEAVE";
+        case 15:  return "4WAY_HANDSHAKE_TIMEOUT - wrong password or weak signal";
+        case 200: return "BEACON_TIMEOUT - lost the AP's signal";
+        case 201: return "NO_AP_FOUND - SSID not visible/out of range";
+        case 202: return "AUTH_FAIL - wrong password";
+        case 203: return "ASSOC_FAIL";
+        case 204: return "HANDSHAKE_TIMEOUT";
+        default:  return "unknown";
+    }
+}
+
+/* WiFi station disconnect events fire with a reason code that is far more */
+/* specific than wl_status_t (which only says WL_CONNECT_FAILED) - this is */
+/* what actually distinguishes "AP out of range", "wrong password", and */
+/* "signal dropped mid-handshake" from each other in the serial log */
+void wifi_event_handler(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
+    {
+        Serial.printf("WiFi disconnected, reason: %u (%s)\r\n",
+                      info.wifi_sta_disconnected.reason,
+                      wifi_disconnect_reason_str(info.wifi_sta_disconnected.reason));
+    }
+}
+
+/* Log which backend IP DNS currently hands out for SERVER_HOST. A */
+/* "connection refused" with a healthy WiFi link and healthy heap points */
+/* at the remote end - logging the resolved IP lets repeated failures be */
+/* compared against successes to see whether they consistently land on a */
+/* different backend IP (e.g. round-robin/anycast DNS routing to a */
+/* server that isn't answering on 443, vs. it being genuinely random) */
+void log_resolved_server_ip(void)
+{
+    IPAddress ip_resolved;
+
+    if (WiFi.hostByName(SERVER_HOST, ip_resolved))
+    {
+        Serial.printf("%s resolves to %s\r\n", SERVER_HOST, ip_resolved.toString().c_str());
+    }
+    else
+    {
+        Serial.printf("DNS lookup failed for %s\r\n", SERVER_HOST);
+    }
+}
+
+/* Fully reset the WiFi radio's internal state. A plain WiFi.disconnect() */
+/* is not enough to recover from a failed connection attempt - the        */
+/* underlying esp_wifi driver can get stuck silently refusing every       */
+/* WiFi.begin() afterwards, even with different, correct credentials on a */
+/* brand new BLE session, unless the radio is cycled fully off and back   */
+/* on between attempts. */
+void wifi_reset_radio(void)
+{
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(DELAY_100MS);
+    WiFi.mode(WIFI_STA);
+    /* Keep the radio fully awake - see the setSleep(false) note in */
+    /* wifi_connect_stored()/wifi_connect_and_store() for why */
+    WiFi.setSleep(false);
+}
+
 /* Connect to WiFi using stored credentials from flash */
 /* Returns true if connected, false if failed or no credentials stored */
 bool wifi_connect_stored(void)
@@ -266,6 +344,12 @@ bool wifi_connect_stored(void)
 
     /* Set WiFi to station mode */
     WiFi.mode(WIFI_STA);
+    /* Disable modem sleep - by default the radio drops into WIFI_PS_MIN_MODEM */
+    /* power-save between beacons right after associating, which can race the */
+    /* HTTPS connect() that follows immediately after WiFi.begin() succeeds on */
+    /* some AP/DTIM-interval combinations. Keeping it fully awake through the */
+    /* connect+upload sequence removes that race */
+    WiFi.setSleep(false);
 
     /* Retry the connection attempt up to WIFI_CONNECT_RETRY_COUNT times */
     /* before giving up, since a single failed attempt is often transient */
@@ -294,13 +378,19 @@ bool wifi_connect_stored(void)
         /* Stop retrying as soon as we are connected */
         if (WiFi.status() == WL_CONNECTED)
         {
-            Serial.printf("WiFi connected, IP: %s\r\n", WiFi.localIP().toString().c_str());
+            /* BSSID identifies the specific physical AP answered by "MIS" - */
+            /* if several APs/mesh nodes share that SSID, a "connection */
+            /* refused" upload could be landing on one with a bad internet */
+            /* uplink even though the local WiFi link itself is fine. Log it */
+            /* so a recurring failure can be correlated to one BSSID */
+            Serial.printf("WiFi connected, IP: %s, BSSID: %s, RSSI: %ld\r\n",
+                          WiFi.localIP().toString().c_str(), WiFi.BSSIDstr().c_str(), (long)WiFi.RSSI());
             return true;
         }
 
         Serial.printf("WiFi connection attempt %ld failed\r\n", i32_attempt);
-        /* Disconnect cleanly before the next attempt */
-        WiFi.disconnect();
+        /* Reset the radio before the next attempt - see wifi_reset_radio() */
+        wifi_reset_radio();
     }
 
     Serial.printf("WiFi connection failed for data upload after %d attempts\r\n", WIFI_CONNECT_RETRY_COUNT);
@@ -394,6 +484,8 @@ void claim_device(void)
     str_url += "&hash=";
     str_url += url_encode(g_str_received_password_hash);
 
+    log_resolved_server_ip();
+
     /* Retry like send_to_server() does - a single transient connection */
     /* failure shouldn't leave the device permanently unclaimed */
     for (i32_attempt = 1; i32_attempt <= DATA_UPLOAD_RETRY_COUNT; i32_attempt++)
@@ -420,9 +512,29 @@ void claim_device(void)
 
             if (i32_response_code == 200)
             {
+                /* Check the body, not just the status code - this host has */
+                /* previously been seen returning a bare 200 block/challenge */
+                /* page instead of running the PHP behind it (see the */
+                /* User-Agent fix in send_to_server()), which would otherwise */
+                /* look identical to a real claim success here */
+                String str_response_body = http_client.getString();
                 Serial.printf("Claim device response: %ld\r\n", i32_response_code);
-                Serial.printf("Claim response body: %s\r\n", http_client.getString().c_str());
+                Serial.printf("Claim response body: %s\r\n", str_response_body.c_str());
                 http_client.end();
+
+                if (str_response_body == "OK")
+                {
+                    /* Tell the phone the claim genuinely succeeded - without */
+                    /* this, the app has no way to distinguish "claimed" from */
+                    /* "WiFi joined but the claim itself silently failed" and */
+                    /* was reporting the latter as success too */
+                    send_status("CLAIM_OK");
+                    g_b_user_credential_received = false;
+                    return;
+                }
+
+                Serial.printf("Claim device: 200 but unexpected body - treating as failure\r\n");
+                send_status("CLAIM_FAILED");
                 g_b_user_credential_received = false;
                 return;
             }
@@ -439,17 +551,19 @@ void claim_device(void)
                 return;
             }
 
-            Serial.printf("Claim device HTTPS GET failed, error: %s\r\n", http_client.errorToString(i32_response_code).c_str());
+            Serial.printf("Claim device HTTPS GET failed, error: %s (free heap: %u)\r\n",
+                          http_client.errorToString(i32_response_code).c_str(), ESP.getFreeHeap());
             http_client.end();
         }
         else
         {
-            Serial.printf("Claim device: failed to begin HTTPS connection\r\n");
+            Serial.printf("Claim device: failed to begin HTTPS connection (free heap: %u)\r\n", ESP.getFreeHeap());
         }
 
+        /* Same backoff+jitter reasoning as send_to_server() */
         if (i32_attempt < DATA_UPLOAD_RETRY_COUNT)
         {
-            delay(DATA_UPLOAD_RETRY_DELAY_MS);
+            delay(DATA_UPLOAD_RETRY_DELAY_MS * i32_attempt + random(0, 500));
         }
     }
 
@@ -486,6 +600,8 @@ void send_to_server(int32_t i32_temperature, int32_t i32_pressure, int32_t i32_h
     str_url += String(i32_battery);
     str_url += "M";
     str_url += str_mac_hex;
+
+    log_resolved_server_ip();
 
     /* Retry the upload up to DATA_UPLOAD_RETRY_COUNT times - transient */
     /* failures like "connection refused" often succeed on the next try */
@@ -533,19 +649,27 @@ void send_to_server(int32_t i32_temperature, int32_t i32_pressure, int32_t i32_h
                 return;
             }
 
-            Serial.printf("HTTPS GET failed, error: %s\r\n", http_client.errorToString(i32_response_code).c_str());
+            /* Free heap alongside the error - a "connection refused" that */
+            /* only shows up when heap is low points at local TLS/socket */
+            /* resource exhaustion rather than the host rejecting us */
+            Serial.printf("HTTPS GET failed, error: %s (free heap: %u)\r\n",
+                          http_client.errorToString(i32_response_code).c_str(), ESP.getFreeHeap());
             /* Close the connection before the next attempt */
             http_client.end();
         }
         else
         {
-            Serial.printf("Unable to connect to server\r\n");
+            Serial.printf("Unable to connect to server (free heap: %u)\r\n", ESP.getFreeHeap());
         }
 
-        /* Short delay before retrying, unless this was the last attempt */
+        /* Back off before retrying, unless this was the last attempt. */
+        /* Delay grows with each attempt plus random jitter so 3 retries */
+        /* in a row don't look like a connection flood to the host's */
+        /* firewall/rate-limiter - a flat 1s gap between identical requests */
+        /* is exactly what trips that kind of protection */
         if (i32_attempt < DATA_UPLOAD_RETRY_COUNT)
         {
-            delay(DATA_UPLOAD_RETRY_DELAY_MS);
+            delay(DATA_UPLOAD_RETRY_DELAY_MS * i32_attempt + random(0, 500));
         }
     }
 
@@ -755,6 +879,8 @@ void wifi_connect_and_store(void)
 
     /* Set WiFi to station mode */
     WiFi.mode(WIFI_STA);
+    /* See the setSleep(false) note in wifi_connect_stored() */
+    WiFi.setSleep(false);
 
     /* Retry the connection attempt up to WIFI_CONNECT_RETRY_COUNT times */
     /* before giving up, since a single failed attempt is often transient */
@@ -805,21 +931,20 @@ void wifi_connect_and_store(void)
         if (WiFi.status() == WL_CONNECT_FAILED)
         {
             Serial.printf("WiFi connection rejected (wrong password?) - not retrying\r\n");
-            WiFi.disconnect();
-            /* Let the driver fully settle before this function either */
-            /* returns (and a new attempt may start right behind it) or - */
-            /* here - falls straight through to the failure report below */
-            delay(DELAY_300MS);
+            /* Reset the radio, not just disconnect - see wifi_reset_radio(). */
+            /* Without this, the driver is left in a bad state and every */
+            /* future WiFi.begin() silently fails too, even a later, */
+            /* correct credential on a fresh BLE session. */
+            wifi_reset_radio();
             break;
         }
 
         Serial.printf("WiFi connection attempt %ld failed\r\n", i32_attempt);
-        /* Disconnect cleanly and let the driver settle before the next */
-        /* attempt - starting a new WiFi.begin() while it's still unwinding */
-        /* the previous one causes "sta is connecting, cannot set config" */
-        /* and the new attempt is silently ignored */
-        WiFi.disconnect();
-        delay(DELAY_300MS);
+        /* Reset the radio before the next attempt - a plain disconnect() */
+        /* is not enough here either (see wifi_reset_radio()), and also */
+        /* avoids "sta is connecting, cannot set config" from starting a */
+        /* new WiFi.begin() while the previous attempt is still unwinding */
+        wifi_reset_radio();
     }
 
     /* If still not connected after all retries, report failure */
@@ -828,15 +953,16 @@ void wifi_connect_and_store(void)
         Serial.printf("WiFi connection failed after %d attempts\r\n", WIFI_CONNECT_RETRY_COUNT);
         /* Notify the phone that connection failed */
         send_status("CONNECT_FAIL");
-        /* Disconnect cleanly and let the driver settle - loop() may invoke */
-        /* this function again immediately if a newer credential is already */
-        /* waiting (see the snapshot note above) */
-        WiFi.disconnect();
-        delay(DELAY_300MS);
+        /* Reset the radio - loop() may invoke this function again */
+        /* immediately if a newer credential is already waiting (see the */
+        /* snapshot note above), and it needs a clean radio to succeed */
+        wifi_reset_radio();
         return;
     }
 
-    Serial.printf("WiFi connected, IP: %s\r\n", WiFi.localIP().toString().c_str());
+    /* See the BSSID note in wifi_connect_stored() */
+    Serial.printf("WiFi connected, IP: %s, BSSID: %s, RSSI: %ld\r\n",
+                  WiFi.localIP().toString().c_str(), WiFi.BSSIDstr().c_str(), (long)WiFi.RSSI());
 
     /* Open the flash storage namespace for writing */
     g_preferences.begin(PREF_NAMESPACE, false);
@@ -958,6 +1084,11 @@ void setup()
     {
         Serial1.read();
     }
+
+    /* Log the specific reason for every WiFi disconnect (see */
+    /* wifi_event_handler) - wl_status_t alone can't tell "AP not found" */
+    /* apart from "wrong password" apart from "signal dropped mid-connect" */
+    WiFi.onEvent(wifi_event_handler);
 
     Serial.printf("UART to USB is initialized\r\n");
 }
