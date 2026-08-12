@@ -17,6 +17,7 @@
 #define UART_INIT_TIME      200u
 #define DELAY_10MS          10u
 #define DELAY_100MS         100u
+#define DELAY_300MS         300u
 #define PARSE_FIELD_COUNT   4
 #define PARSE_SUCCESS       4
 #define TEMP_SCALE          100
@@ -32,13 +33,16 @@
 #define DEVICE_MAC_HEX_LEN  (DEVICE_MAC_LEN * 2)
 
 /* Server URL for data upload */
-//#define DATA_URL            "https://alxlabs.ca/books/env_sensor/web/data.php"
-//#define DATA_URL            "https://alxlabs.ca/books/env_sensor/web/update_alx_setup.php"
 #define DATA_URL            "https://alxlabs.ca/books/env_sensor/web/update_alx.php"
 /* WiFi connection timeout for data upload */
 #define WIFI_DATA_TIMEOUT   15000u
 /* Server URL used once, right after BLE setup connects to WiFi, to link */
-/* this device to whichever dashboard account the phone was logged into */
+/* this device to whichever dashboard account the phone was logged into. */
+/* For a brand new device (no row in the devices table yet), temporarily */
+/* swap to claim_device_alx.php instead - it just registers the device */
+/* with user_id = 0 so a later BLE setup run against the real */
+/* claim_device.php below has a row to claim. */
+//#define CLAIM_URL            "https://alxlabs.ca/books/env_sensor/web/claim_device_alx.php"
 #define CLAIM_URL            "https://alxlabs.ca/books/env_sensor/web/claim_device.php"
 
 /* BLE UUIDs for the GATT service and characteristics */
@@ -58,6 +62,7 @@
 #define WIFI_SCAN_TIMEOUT   10000u
 #define WIFI_CONNECT_TIMEOUT 15000u
 #define WIFI_CONNECT_RETRY_COUNT 5
+#define WIFI_CONNECT_FAIL_GRACE_MS 3000u
 #define DATA_UPLOAD_RETRY_COUNT 3
 #define DATA_UPLOAD_RETRY_DELAY_MS 1000u
 #define DATA_UPLOAD_TIMEOUT_MS 8000u
@@ -123,6 +128,14 @@ class NimbusServerCallbacks : public BLEServerCallbacks
         /* Clear the connected flag */
         g_b_client_connected = false;
         Serial.printf("BLE client disconnected\r\n");
+
+        /* Only now tell the STM32 the setup session is actually over. */
+        /* READY_PIN going low is what wakes ConfirmComm()'s wait out of */
+        /* WiFiSetup() on the STM32 side, which then powers this board */
+        /* down - pulling it low after a single (possibly failed) */
+        /* credential attempt instead of here cut power mid-retry the */
+        /* moment a wrong WiFi password was entered */
+        digitalWrite(READY_PIN, LOW);
     }
 };
 
@@ -324,6 +337,36 @@ void get_device_mac_hex(char *str_hex_out)
     str_hex_out[DEVICE_MAC_HEX_LEN] = '\0';
 }
 
+/* Percent-encodes str_in per RFC 3986 (unreserved = A-Za-z0-9-._~), so */
+/* values placed into a query string can't be misread as part of the URL */
+/* structure - or, on this host, mistaken by the WAF for something else. */
+/* A bcrypt hash's literal "$2y$10$..." shape in particular reads like a */
+/* PHP-injection payload to some WAF rulesets if sent unencoded. */
+String url_encode(const String &str_in)
+{
+    static const char c_hex_digits[] = "0123456789ABCDEF";
+    String str_out;
+    char c_ch;
+    size_t sz_idx;
+
+    for (sz_idx = 0; sz_idx < str_in.length(); sz_idx++)
+    {
+        c_ch = str_in[sz_idx];
+        if (isalnum((unsigned char)c_ch) || c_ch == '-' || c_ch == '.' || c_ch == '_' || c_ch == '~')
+        {
+            str_out += c_ch;
+        }
+        else
+        {
+            str_out += '%';
+            str_out += c_hex_digits[((unsigned char)c_ch >> 4) & 0x0F];
+            str_out += c_hex_digits[(unsigned char)c_ch & 0x0F];
+        }
+    }
+
+    return str_out;
+}
+
 /* Sends this device's MAC together with the dashboard username/password */
 /* hash received over BLE (if any) to claim_device.php, linking the */
 /* device to that account. Called once, right after WiFi connects during */
@@ -334,6 +377,7 @@ void claim_device(void)
     String str_url;
     char str_mac_hex[DEVICE_MAC_HEX_LEN + 1];
     int32_t i32_response_code;
+    int32_t i32_attempt;
 
     if (!g_b_user_credential_received)
     {
@@ -346,36 +390,74 @@ void claim_device(void)
     str_url += "?mac=";
     str_url += str_mac_hex;
     str_url += "&username=";
-    str_url += g_str_received_username;
+    str_url += url_encode(g_str_received_username);
     str_url += "&hash=";
-    str_url += g_str_received_password_hash;
+    str_url += url_encode(g_str_received_password_hash);
 
-    WiFiClientSecure wifi_client;
-    HTTPClient http_client;
-
-    /* Skip certificate verification for now */
-    /* Production should use a root CA certificate */
-    wifi_client.setInsecure();
-    wifi_client.setHandshakeTimeout(DATA_UPLOAD_TIMEOUT_MS / 1000u);
-
-    if (http_client.begin(wifi_client, str_url))
+    /* Retry like send_to_server() does - a single transient connection */
+    /* failure shouldn't leave the device permanently unclaimed */
+    for (i32_attempt = 1; i32_attempt <= DATA_UPLOAD_RETRY_COUNT; i32_attempt++)
     {
-        http_client.setConnectTimeout(DATA_UPLOAD_TIMEOUT_MS);
-        http_client.setTimeout(DATA_UPLOAD_TIMEOUT_MS);
-        http_client.addHeader("User-Agent", "Mozilla/5.0 (NimbusWeatherStation)");
-        http_client.addHeader("Accept", "*/*");
+        WiFiClientSecure wifi_client;
+        HTTPClient http_client;
 
-        i32_response_code = http_client.GET();
-        Serial.printf("Claim device response: %ld\r\n", i32_response_code);
-        Serial.printf("Claim response body: %s\r\n", http_client.getString().c_str());
+        Serial.printf("Claiming device (attempt %ld/%d): %s\r\n",
+                      i32_attempt, DATA_UPLOAD_RETRY_COUNT, str_url.c_str());
 
-        http_client.end();
+        /* Skip certificate verification for now */
+        /* Production should use a root CA certificate */
+        wifi_client.setInsecure();
+        wifi_client.setHandshakeTimeout(DATA_UPLOAD_TIMEOUT_MS / 1000u);
+
+        if (http_client.begin(wifi_client, str_url))
+        {
+            http_client.setConnectTimeout(DATA_UPLOAD_TIMEOUT_MS);
+            http_client.setTimeout(DATA_UPLOAD_TIMEOUT_MS);
+            http_client.addHeader("User-Agent", "Mozilla/5.0 (NimbusWeatherStation)");
+            http_client.addHeader("Accept", "*/*");
+
+            i32_response_code = http_client.GET();
+
+            if (i32_response_code == 200)
+            {
+                Serial.printf("Claim device response: %ld\r\n", i32_response_code);
+                Serial.printf("Claim response body: %s\r\n", http_client.getString().c_str());
+                http_client.end();
+                g_b_user_credential_received = false;
+                return;
+            }
+            else if (i32_response_code > 0)
+            {
+                /* server responded but rejected the claim (e.g. hash didn't */
+                /* match) - retrying won't change that outcome, so tell the */
+                /* phone now instead of burning the remaining attempts */
+                Serial.printf("Claim device rejected: %ld\r\n", i32_response_code);
+                Serial.printf("Claim response body: %s\r\n", http_client.getString().c_str());
+                http_client.end();
+                send_status("CLAIM_FAILED");
+                g_b_user_credential_received = false;
+                return;
+            }
+
+            Serial.printf("Claim device HTTPS GET failed, error: %s\r\n", http_client.errorToString(i32_response_code).c_str());
+            http_client.end();
+        }
+        else
+        {
+            Serial.printf("Claim device: failed to begin HTTPS connection\r\n");
+        }
+
+        if (i32_attempt < DATA_UPLOAD_RETRY_COUNT)
+        {
+            delay(DATA_UPLOAD_RETRY_DELAY_MS);
+        }
     }
-    else
-    {
-        Serial.printf("Claim device: failed to begin HTTPS connection\r\n");
-    }
 
+    /* Every attempt failed at the connection level (never got a response */
+    /* at all) - let the phone know instead of leaving it thinking CONNECT_OK */
+    /* (WiFi joined fine) meant the whole setup succeeded */
+    Serial.printf("Claim device failed after %d attempts\r\n", DATA_UPLOAD_RETRY_COUNT);
+    send_status("CLAIM_FAILED");
     g_b_user_credential_received = false;
 }
 
@@ -652,6 +734,21 @@ void wifi_connect_and_store(void)
 {
     uint32_t ui32_timeout;
     int32_t i32_attempt;
+    String str_ssid;
+    String str_pass;
+
+    /* Snapshot the credentials this call is connecting with. The phone can */
+    /* write a new credential over BLE at any time, including while this */
+    /* function is still retrying an earlier one - delay() below yields to */
+    /* the BLE stack, so its callback can run and overwrite */
+    /* g_str_received_ssid/pass mid-loop. Reading the globals fresh on each */
+    /* retry let a stale attempt silently swap to different credentials */
+    /* partway through and confused the WiFi driver into refusing to */
+    /* reconnect ("sta is connecting, cannot set config"). Any credential */
+    /* that arrives during this call is left for the next one, once */
+    /* g_b_credential_received is set again. */
+    str_ssid = g_str_received_ssid;
+    str_pass = g_str_received_pass;
 
     /* Notify the phone that connection is being attempted */
     send_status("CONNECTING");
@@ -664,19 +761,30 @@ void wifi_connect_and_store(void)
     for (i32_attempt = 1; i32_attempt <= WIFI_CONNECT_RETRY_COUNT; i32_attempt++)
     {
         Serial.printf("Connecting to '%s' (attempt %ld/%d)...\r\n",
-                      g_str_received_ssid.c_str(), i32_attempt, WIFI_CONNECT_RETRY_COUNT);
+                      str_ssid.c_str(), i32_attempt, WIFI_CONNECT_RETRY_COUNT);
 
         /* Begin the connection attempt with the received credentials */
-        WiFi.begin(g_str_received_ssid.c_str(), g_str_received_pass.c_str());
+        WiFi.begin(str_ssid.c_str(), str_pass.c_str());
 
         /* Record the start time for timeout detection */
         ui32_timeout = millis();
 
-        /* Wait for connection to establish or timeout to expire */
+        /* Wait for connection to establish, a definitive rejection (e.g. */
+        /* wrong password), or timeout to expire. WL_CONNECT_FAILED is only */
+        /* trusted after WIFI_CONNECT_FAIL_GRACE_MS - right after */
+        /* WiFi.begin(), status() can still briefly return the *previous* */
+        /* attempt's leftover WL_CONNECT_FAILED before the driver updates it */
+        /* to reflect this attempt, which otherwise looks identical to a */
+        /* real, immediate rejection of a perfectly correct password */
         while (WiFi.status() != WL_CONNECTED)
         {
-            /* Check if the timeout has been exceeded */
-            if ((millis() - ui32_timeout) >= WIFI_CONNECT_TIMEOUT)
+            uint32_t ui32_elapsed = millis() - ui32_timeout;
+
+            if (ui32_elapsed >= WIFI_CONNECT_TIMEOUT)
+            {
+                break;
+            }
+            if (ui32_elapsed >= WIFI_CONNECT_FAIL_GRACE_MS && WiFi.status() == WL_CONNECT_FAILED)
             {
                 break;
             }
@@ -690,9 +798,28 @@ void wifi_connect_and_store(void)
             break;
         }
 
+        /* WL_CONNECT_FAILED means the AP actively rejected the handshake */
+        /* (wrong password) rather than just being unreachable - retrying */
+        /* with the same credentials would only fail the same way again, */
+        /* so give up immediately instead of burning the remaining attempts */
+        if (WiFi.status() == WL_CONNECT_FAILED)
+        {
+            Serial.printf("WiFi connection rejected (wrong password?) - not retrying\r\n");
+            WiFi.disconnect();
+            /* Let the driver fully settle before this function either */
+            /* returns (and a new attempt may start right behind it) or - */
+            /* here - falls straight through to the failure report below */
+            delay(DELAY_300MS);
+            break;
+        }
+
         Serial.printf("WiFi connection attempt %ld failed\r\n", i32_attempt);
-        /* Disconnect cleanly before the next attempt */
+        /* Disconnect cleanly and let the driver settle before the next */
+        /* attempt - starting a new WiFi.begin() while it's still unwinding */
+        /* the previous one causes "sta is connecting, cannot set config" */
+        /* and the new attempt is silently ignored */
         WiFi.disconnect();
+        delay(DELAY_300MS);
     }
 
     /* If still not connected after all retries, report failure */
@@ -701,8 +828,11 @@ void wifi_connect_and_store(void)
         Serial.printf("WiFi connection failed after %d attempts\r\n", WIFI_CONNECT_RETRY_COUNT);
         /* Notify the phone that connection failed */
         send_status("CONNECT_FAIL");
-        /* Disconnect cleanly */
+        /* Disconnect cleanly and let the driver settle - loop() may invoke */
+        /* this function again immediately if a newer credential is already */
+        /* waiting (see the snapshot note above) */
         WiFi.disconnect();
+        delay(DELAY_300MS);
         return;
     }
 
@@ -711,9 +841,9 @@ void wifi_connect_and_store(void)
     /* Open the flash storage namespace for writing */
     g_preferences.begin(PREF_NAMESPACE, false);
     /* Store the SSID */
-    g_preferences.putString(PREF_KEY_SSID, g_str_received_ssid);
+    g_preferences.putString(PREF_KEY_SSID, str_ssid);
     /* Store the password */
-    g_preferences.putString(PREF_KEY_PASS, g_str_received_pass);
+    g_preferences.putString(PREF_KEY_PASS, str_pass);
     /* Set the valid flag so future boots know credentials are stored */
     g_preferences.putBool(PREF_KEY_VALID, true);
     /* Close the flash storage */
@@ -886,11 +1016,13 @@ void loop()
     {
         /* Clear the flag before processing */
         g_b_credential_received = false;
-        /* Attempt to connect and store credentials on success */
+        /* Attempt to connect and store credentials on success. Deliberately */
+        /* does NOT pull READY_PIN low here - that would tell the STM32 the */
+        /* whole setup session is finished after just one attempt, even */
+        /* though the phone may still be about to retry with a different */
+        /* password. READY_PIN only goes low once BLE actually disconnects */
+        /* (see NimbusServerCallbacks::onDisconnect) */
         wifi_connect_and_store();
-        /* Print this info */
         Serial.printf ("DONE, network connected and stored\r\n");
-        /* Signal readiness to STM32 */
-        digitalWrite(READY_PIN, LOW);
     }
 }

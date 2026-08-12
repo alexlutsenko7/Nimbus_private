@@ -9,6 +9,10 @@ $SMTP_PASS = 'ewhf mymc amou jegg';    // app password from Google
 $SMTP_FROM = "alxlabs@gmail.com";
 $SMTP_FROM_NAME = "Nimbus";
 
+// Base URL this app is deployed at - used to build the link inside
+// confirmation emails. Must end with a trailing slash.
+$SITE_URL = "https://alxlabs.ca/books/env_sensor/web/";
+
 
 $DB_HOST = 'localhost';
 $DB_USER = 'nqzcrcmy_alxlabs';

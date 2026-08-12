@@ -158,6 +158,16 @@ class MainActivity : ComponentActivity() {
     /* Updated by handleStatusUpdate when the ESP32 sends notifications */
     private val provisioningStatus = mutableStateOf("")
 
+    /* Watchdog for the WiFi-connect step: if the ESP32 never reports a */
+    /* terminal status (CONNECT_OK/CONNECT_FAIL/CLAIM_FAILED/ERROR) after */
+    /* credentials are sent - e.g. a BLE notification gets dropped, or the */
+    /* firmware's own retry loop takes its full ~75s worst case for a wrong */
+    /* password - the UI would otherwise sit on "Connecting to WiFi..." */
+    /* indefinitely. */
+    private val wifiConnectHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var wifiConnectTimeoutRunnable: Runnable? = null
+    private val wifiConnectTimeoutMs = 90000L
+
     /* WiFi credential (ssid, password) waiting to be written once the */
     /* user-credential write ahead of it finishes - see onCharacteristicWrite */
     private var pendingWifiCredential: Pair<String, String>? = null
@@ -535,6 +545,31 @@ class MainActivity : ComponentActivity() {
         /* Reset connection state flags */
         isConnected.value = false
         isConnecting.value = false
+        cancelWifiConnectTimeout()
+    }
+
+    /*
+     * Starts (restarting if already running) the WiFi-connect watchdog.
+     * Call right after the WiFi credential write is issued; cancel via
+     * cancelWifiConnectTimeout() as soon as a terminal status arrives.
+     */
+    private fun startWifiConnectTimeout() {
+        cancelWifiConnectTimeout()
+        val runnable = Runnable {
+            Log.w("BLE_GATT", "WiFi connect timed out - no response from device")
+            provisioningStatus.value = "WiFi connection failed. Check the password and try again."
+            Toast.makeText(this, "WiFi connection failed", Toast.LENGTH_LONG).show()
+        }
+        wifiConnectTimeoutRunnable = runnable
+        wifiConnectHandler.postDelayed(runnable, wifiConnectTimeoutMs)
+    }
+
+    /*
+     * Cancels the WiFi-connect watchdog, if one is pending.
+     */
+    private fun cancelWifiConnectTimeout() {
+        wifiConnectTimeoutRunnable?.let { wifiConnectHandler.removeCallbacks(it) }
+        wifiConnectTimeoutRunnable = null
     }
 
     /*
@@ -598,6 +633,7 @@ class MainActivity : ComponentActivity() {
                 }, 500)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.d("BLE_GATT", "Disconnected")
+                cancelWifiConnectTimeout()
                 /* Reset connection state on the main thread */
                 runOnUiThread {
                     isConnected.value = false
@@ -796,6 +832,8 @@ class MainActivity : ComponentActivity() {
         credentialChar.value = payload.toByteArray()
         /* Send the write to the ESP32 */
         bluetoothGatt?.writeCharacteristic(credentialChar)
+        /* Bound how long we wait for a terminal status back */
+        startWifiConnectTimeout()
 
         Log.d("BLE_GATT", "Credentials sent for SSID: $ssid")
     }
@@ -904,18 +942,28 @@ class MainActivity : ComponentActivity() {
             }
             /* ESP32 connected and stored credentials */
             status == "CONNECT_OK" -> {
+                cancelWifiConnectTimeout()
                 provisioningStatus.value = "WiFi connected! Credentials saved."
                 /* Show success toast */
                 Toast.makeText(this, "Sensor configured successfully!", Toast.LENGTH_LONG).show()
             }
             /* ESP32 failed to connect */
             status == "CONNECT_FAIL" -> {
+                cancelWifiConnectTimeout()
                 provisioningStatus.value = "WiFi connection failed. Check password."
                 /* Show failure toast */
                 Toast.makeText(this, "WiFi connection failed", Toast.LENGTH_LONG).show()
             }
+            /* ESP32 joined WiFi (CONNECT_OK already fired) but couldn't */
+            /* reach the server to link this sensor to the account */
+            status == "CLAIM_FAILED" -> {
+                cancelWifiConnectTimeout()
+                provisioningStatus.value = "WiFi connection problems"
+                Toast.makeText(this, "WiFi connection problems", Toast.LENGTH_LONG).show()
+            }
             /* Any error from the ESP32 */
             status.startsWith("ERROR") -> {
+                cancelWifiConnectTimeout()
                 provisioningStatus.value = status
             }
         }

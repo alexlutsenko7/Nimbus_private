@@ -32,9 +32,11 @@ $noise = imagecolorallocate($image, 35, 47, 58);
 imagefill($image, 0, 0, $bg);
 
 /* noise lines and dots so the code isn't trivially readable by simple OCR */
+/* lines use $fg (same brightness as the characters) so they read as part */
+/* of the same visual layer instead of fading into the background */
 for ($i = 0; $i < 6; $i++)
 {
-    imageline($image, random_int(0, $width), random_int(0, $height), random_int(0, $width), random_int(0, $height), $noise);
+    imageline($image, random_int(0, $width), random_int(0, $height), random_int(0, $width), random_int(0, $height), $fg);
 }
 for ($i = 0; $i < 80; $i++)
 {

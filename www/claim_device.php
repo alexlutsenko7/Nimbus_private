@@ -45,7 +45,23 @@ try
         $update->bind_param('is', $user_id, $mac_binary);
         $update->execute();
         $update->close();
-        $claimed = true;
+
+        /* Don't just trust that the UPDATE above took effect - re-read the */
+        /* row and confirm it now belongs to this user before reporting     */
+        /* success. Without this, a request that never actually reaches    */
+        /* this script's DB call (e.g. swallowed by the host's WAF, which  */
+        /* has previously been seen returning a bare HTTP 200 without      */
+        /* running the PHP behind it) would still echo "OK", leaving a     */
+        /* device silently owned by its previous claimant. */
+        $verify = $mysqli->prepare('SELECT user_id FROM devices WHERE device_number = ? LIMIT 1');
+        $verify->bind_param('s', $mac_binary);
+        $verify->execute();
+        $verify->store_result();
+        $verify->bind_result($current_owner_id);
+        $verify_found = ($verify->num_rows === 1) && $verify->fetch();
+        $verify->close();
+
+        $claimed = $verify_found && ((int)$current_owner_id === (int)$user_id);
     }
 
     $mysqli->close();

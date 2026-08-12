@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/mailer.php';
 
 /* PHP session is used only to hold the current CAPTCHA code between the */
 /* time captcha.php renders it and the register form being submitted - */
@@ -33,7 +34,21 @@ if (isset($_GET['logout']))
 /* --------------------------------------------------------------------- */
 $auth_error = '';
 $registered = isset($_GET['registered']);
-$view = (($_POST['action'] ?? $_GET['view'] ?? '') === 'register') ? 'register' : 'login';
+$confirmed_msg = isset($_GET['confirmed']);
+$password_reset_msg = isset($_GET['password_reset']);
+$view_param = $_POST['action'] ?? $_GET['view'] ?? '';
+if ($view_param === 'register')
+{
+    $view = 'register';
+}
+elseif ($view_param === 'forgot_password' || $view_param === 'request_reset')
+{
+    $view = 'forgot_password';
+}
+else
+{
+    $view = 'login';
+}
 
 $mysqli = null;
 try
@@ -83,29 +98,64 @@ if ($mysqli !== null && $_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action
     {
         try
         {
-            $stmt = $mysqli->prepare('SELECT id FROM users WHERE username = ? LIMIT 1');
+            $stmt = $mysqli->prepare('SELECT id, confirmed FROM users WHERE username = ? LIMIT 1');
             $stmt->bind_param('s', $username);
             $stmt->execute();
             $stmt->store_result();
+            $stmt->bind_result($existing_id, $existing_confirmed);
+            $existing_found = ($stmt->num_rows === 1) && $stmt->fetch();
+            $stmt->close();
 
-            if ($stmt->num_rows > 0)
+            if ($existing_found && $existing_confirmed)
             {
                 $auth_error = 'That username is already taken.';
-                $stmt->close();
             }
             else
             {
-                $stmt->close();
+                /* Either a brand new username, or a previous registration */
+                /* that was never confirmed - build the new credentials and */
+                /* email before touching the DB, so a failed send never */
+                /* leaves a row (new or overwritten) that can't be confirmed */
                 $password_hash = password_hash($password, PASSWORD_DEFAULT);
-                $insert = $mysqli->prepare(
-                    'INSERT INTO users (username, password_hash, email, confirmed) VALUES (?, ?, ?, 1)'
+                $confirm_token = bin2hex(random_bytes(32));
+                $confirm_link = $SITE_URL . 'confirm.php?token=' . $confirm_token;
+                $mail_sent = send_confirmation_email(
+                    $SMTP_HOST, $SMTP_PORT, $SMTP_USER, $SMTP_PASS, $SMTP_FROM, $SMTP_FROM_NAME,
+                    $email, $username, $confirm_link
                 );
-                $insert->bind_param('sss', $username, $password_hash, $email);
-                $insert->execute();
-                $insert->close();
 
-                header('Location: index.php?registered=1');
-                exit;
+                if (!$mail_sent)
+                {
+                    $auth_error = 'Could not send the confirmation email. Please try again later.';
+                }
+                elseif ($existing_found)
+                {
+                    /* Replace the old unconfirmed registration in place - */
+                    /* the "confirmed = 0" guard re-checks at write time in */
+                    /* case the old link got confirmed between the SELECT */
+                    /* above and this UPDATE */
+                    $update = $mysqli->prepare(
+                        'UPDATE users SET password_hash = ?, email = ?, confirm_token = ? WHERE id = ? AND confirmed = 0'
+                    );
+                    $update->bind_param('sssi', $password_hash, $email, $confirm_token, $existing_id);
+                    $update->execute();
+                    $update->close();
+
+                    header('Location: index.php?registered=1');
+                    exit;
+                }
+                else
+                {
+                    $insert = $mysqli->prepare(
+                        'INSERT INTO users (username, password_hash, email, confirmed, confirm_token) VALUES (?, ?, ?, 0, ?)'
+                    );
+                    $insert->bind_param('ssss', $username, $password_hash, $email, $confirm_token);
+                    $insert->execute();
+                    $insert->close();
+
+                    header('Location: index.php?registered=1');
+                    exit;
+                }
             }
         }
         catch (Throwable $e)
@@ -124,15 +174,19 @@ if ($mysqli !== null && $_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action
 
     try
     {
-        $stmt = $mysqli->prepare('SELECT password_hash FROM users WHERE username = ? LIMIT 1');
+        $stmt = $mysqli->prepare('SELECT password_hash, confirmed FROM users WHERE username = ? LIMIT 1');
         $stmt->bind_param('s', $username);
         $stmt->execute();
         $stmt->store_result();
-        $stmt->bind_result($db_hash);
+        $stmt->bind_result($db_hash, $db_confirmed);
         $found = ($stmt->num_rows === 1) && $stmt->fetch();
         $stmt->close();
 
-        if ($found && password_verify($password, $db_hash))
+        if ($found && password_verify($password, $db_hash) && !$db_confirmed)
+        {
+            $auth_error = 'Please confirm your email address before logging in - check your inbox for the confirmation link.';
+        }
+        elseif ($found && password_verify($password, $db_hash))
         {
             setcookie($COOKIE_NAME, $username . '|' . $db_hash, [
                 'expires'  => $COOKIE_EXPIRE,
@@ -144,13 +198,75 @@ if ($mysqli !== null && $_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action
             header('Location: index.php');
             exit;
         }
-
-        $auth_error = 'Invalid username or password.';
+        else
+        {
+            $auth_error = 'Invalid username or password.';
+        }
     }
     catch (Throwable $e)
     {
         error_log('index.php: login failed: ' . $e->getMessage());
         $auth_error = 'Something went wrong. Please try again later.';
+    }
+}
+
+/* ---- forgot password: email a reset link ---- */
+$reset_error = '';
+
+if ($mysqli !== null && $_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'request_reset')
+{
+    $reset_email = trim($_POST['email'] ?? '');
+
+    if (!filter_var($reset_email, FILTER_VALIDATE_EMAIL))
+    {
+        $reset_error = 'Please enter a valid email address.';
+    }
+    else
+    {
+        try
+        {
+            /* Only confirmed accounts get a reset link - an unconfirmed */
+            /* registration should be redone from scratch (same username) */
+            /* rather than "recovered" */
+            $stmt = $mysqli->prepare('SELECT id, username FROM users WHERE email = ? AND confirmed = 1 LIMIT 1');
+            $stmt->bind_param('s', $reset_email);
+            $stmt->execute();
+            $stmt->store_result();
+            $stmt->bind_result($reset_user_id, $reset_username);
+            $reset_found = ($stmt->num_rows === 1) && $stmt->fetch();
+            $stmt->close();
+
+            if ($reset_found)
+            {
+                /* Only a pending reset_token/reset_expires pair is written */
+                /* here - the account's password_hash is untouched until the */
+                /* link is actually opened and a new password submitted on */
+                /* reset_password.php */
+                $reset_token = bin2hex(random_bytes(32));
+                $reset_expires = date('Y-m-d H:i:s', time() + 3600);
+
+                $update = $mysqli->prepare('UPDATE users SET reset_token = ?, reset_expires = ? WHERE id = ?');
+                $update->bind_param('ssi', $reset_token, $reset_expires, $reset_user_id);
+                $update->execute();
+                $update->close();
+
+                $reset_link = $SITE_URL . 'reset_password.php?token=' . $reset_token;
+                send_password_reset_email(
+                    $SMTP_HOST, $SMTP_PORT, $SMTP_USER, $SMTP_PASS, $SMTP_FROM, $SMTP_FROM_NAME,
+                    $reset_email, $reset_username, $reset_link
+                );
+            }
+        }
+        catch (Throwable $e)
+        {
+            error_log('index.php: password reset request failed: ' . $e->getMessage());
+        }
+
+        /* Same redirect regardless of whether the email matched an account */
+        /* or the mail send succeeded - otherwise the response would leak */
+        /* which addresses are registered */
+        header('Location: index.php?view=forgot_password&sent=1');
+        exit;
     }
 }
 
@@ -490,9 +606,24 @@ if ($current_user === null)
                 <button type="submit">Create account</button>
             </form>
             <div class="switch">Already have an account? <a href="index.php?view=login">Log in</a></div>
+        <?php elseif ($view === 'forgot_password'): ?>
+            <h1>Reset password</h1>
+            <?php if (isset($_GET['sent'])): ?>
+                <div class="auth-msg ok">If that email is registered, a reset link has been sent - check your spam folder too.</div>
+            <?php endif; ?>
+            <?php if ($reset_error !== ''): ?><div class="auth-msg error"><?php echo htmlspecialchars($reset_error); ?></div><?php endif; ?>
+            <form method="post" action="index.php">
+                <input type="hidden" name="action" value="request_reset">
+                <label for="email">Email</label>
+                <input type="email" id="email" name="email" maxlength="255" required>
+                <button type="submit">Send reset link</button>
+            </form>
+            <div class="switch"><a href="index.php?view=login">Back to login</a></div>
         <?php else: ?>
             <h1>Nimbus Weather Station</h1>
-            <?php if ($registered): ?><div class="auth-msg ok">Account created - please log in.</div><?php endif; ?>
+            <?php if ($registered): ?><div class="auth-msg ok">Account created - check your email for a confirmation link before logging in. Didn't get it? Check your spam folder, or register again with the same username to get a new link.</div><?php endif; ?>
+            <?php if ($confirmed_msg): ?><div class="auth-msg ok">Email confirmed - please log in.</div><?php endif; ?>
+            <?php if ($password_reset_msg): ?><div class="auth-msg ok">Password reset - please log in with your new password.</div><?php endif; ?>
             <?php if ($auth_error !== ''): ?><div class="auth-msg error"><?php echo htmlspecialchars($auth_error); ?></div><?php endif; ?>
             <form method="post" action="index.php">
                 <input type="hidden" name="action" value="login">
@@ -503,6 +634,7 @@ if ($current_user === null)
                 <button type="submit">Log in</button>
             </form>
             <div class="switch">No account yet? <a href="index.php?view=register">Create one</a></div>
+            <div class="switch"><a href="index.php?view=forgot_password">Forgot password?</a></div>
         <?php endif; ?>
     </div>
 </body>
@@ -519,6 +651,7 @@ if ($current_user === null)
 /* reported reading (devices.last_reading, updated by update_alx.php) - */
 /* no data.json file is used any more */
 $device = null;
+$has_reading = false;
 $temp_val = '--';
 $press_val = '--';
 $hum_val = '--';
@@ -550,8 +683,12 @@ if ($mysqli !== null)
             {
                 $d = json_decode($db_last_reading, true);
 
-                if ($d !== null)
+                /* treat a decoded-but-incomplete reading (e.g. "{}") the */
+                /* same as no reading at all, rather than emitting warnings */
+                /* for missing keys and rendering a half-populated dashboard */
+                if ($d !== null && isset($d['temperature'], $d['pressure'], $d['humidity'], $d['battery'], $d['timestamp']))
                 {
+                    $has_reading = true;
                     /* temperature: stored as integer * 100, display as XX.XX */
                     $temp_val = number_format($d['temperature'] / 100, 2);
                     /* pressure: stored in Pa, display as hPa */
@@ -748,11 +885,6 @@ if ($mysqli !== null)
         margin-bottom: 0.7rem;
     }
 
-    .no-devices {
-        font-size: 0.88rem;
-        color: var(--ink-dim);
-    }
-
     .device-row {
         display: flex;
         justify-content: space-between;
@@ -785,6 +917,18 @@ if ($mysqli !== null)
         color: var(--ink-dim);
     }
 
+    .empty-state {
+        width: 100%;
+        max-width: 760px;
+        background: var(--panel);
+        border: 1px solid var(--panel-edge);
+        border-radius: 10px;
+        padding: 2.4rem 1.4rem;
+        text-align: center;
+        font-size: 0.95rem;
+        color: var(--ink-dim);
+    }
+
     @media (max-width: 520px) {
         .grid {
             grid-template-columns: 1fr;
@@ -805,14 +949,15 @@ if ($mysqli !== null)
         .reading .unit {
             font-size: 0.82rem;
         }
+        .empty-state {
+            padding: 1.6rem 1rem;
+            font-size: 0.85rem;
+        }
         .devices {
             padding: 0.8rem 1rem;
         }
         .devices-title {
             font-size: 0.64rem;
-        }
-        .no-devices {
-            font-size: 0.78rem;
         }
         .device-row {
             font-size: 0.76rem;
@@ -840,44 +985,54 @@ if ($mysqli !== null)
     <div class="banner-ok">Password changed.</div>
     <?php endif; ?>
 
-    <div class="grid">
-        <div class="reading">
-            <div class="label">Temperature</div>
-            <div class="value"><?php echo $temp_val; ?><span class="unit">&deg;C</span></div>
-        </div>
+    <?php if ($device === null): ?>
+        <div class="empty-state">No sensors added</div>
+    <?php elseif (!$has_reading): ?>
+        <div class="empty-state">Device has been added, now waiting for data - this may take ~15 minutes.</div>
 
-        <div class="reading">
-            <div class="label">Pressure</div>
-            <div class="value"><?php echo $press_val; ?><span class="unit">hPa</span></div>
-        </div>
-
-        <div class="reading">
-            <div class="label">Humidity</div>
-            <div class="value"><?php echo $hum_val; ?><span class="unit">%</span></div>
-        </div>
-
-        <div class="reading battery">
-            <div class="label">Battery</div>
-            <div class="value<?php echo $batt_class; ?>"><?php echo $batt_val; ?><span class="unit">mV</span></div>
-        </div>
-    </div>
-
-    <div class="devices">
-        <div class="devices-title">Device</div>
-        <?php if ($device === null): ?>
-            <div class="no-devices">No devices, add one.</div>
-        <?php else: ?>
+        <div class="devices">
+            <div class="devices-title">Device</div>
             <div class="device-row">
                 <span class="device-number"><?php echo htmlspecialchars($device['device_number']); ?></span>
                 <span class="device-created">Added <?php echo htmlspecialchars($device['created_at']); ?></span>
             </div>
-        <?php endif; ?>
-    </div>
+        </div>
+    <?php else: ?>
+        <div class="grid">
+            <div class="reading">
+                <div class="label">Temperature</div>
+                <div class="value"><?php echo $temp_val; ?><span class="unit">&deg;C</span></div>
+            </div>
 
-    <div class="footer">
-        <span><?php echo $timestamp; ?></span>
-        <span><?php echo $source_ip; ?></span>
-    </div>
+            <div class="reading">
+                <div class="label">Pressure</div>
+                <div class="value"><?php echo $press_val; ?><span class="unit">hPa</span></div>
+            </div>
+
+            <div class="reading">
+                <div class="label">Humidity</div>
+                <div class="value"><?php echo $hum_val; ?><span class="unit">%</span></div>
+            </div>
+
+            <div class="reading battery">
+                <div class="label">Battery</div>
+                <div class="value<?php echo $batt_class; ?>"><?php echo $batt_val; ?><span class="unit">mV</span></div>
+            </div>
+        </div>
+
+        <div class="devices">
+            <div class="devices-title">Device</div>
+            <div class="device-row">
+                <span class="device-number"><?php echo htmlspecialchars($device['device_number']); ?></span>
+                <span class="device-created">Added <?php echo htmlspecialchars($device['created_at']); ?></span>
+            </div>
+        </div>
+
+        <div class="footer">
+            <span><?php echo $timestamp; ?></span>
+            <span><?php echo $source_ip; ?></span>
+        </div>
+    <?php endif; ?>
 
 </body>
 </html>
