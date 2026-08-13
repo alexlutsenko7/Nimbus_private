@@ -41,7 +41,7 @@
 #define DEVICE_MAC_HEX_LEN  (DEVICE_MAC_LEN * 2)
 
 /* Hostname shared by DATA_URL and CLAIM_URL below, used to log which */
-/* backend IP DNS handed us on each upload - see log_resolved_server_ip() */
+/* backend IP DNS handed us on each upload - see wifi_check_dns_healthy() */
 #define SERVER_HOST         "alxlabs.ca"
 /* Server URL for data upload */
 #define DATA_URL            "https://alxlabs.ca/books/env_sensor/web/update_alx.php"
@@ -302,24 +302,33 @@ void wifi_event_handler(WiFiEvent_t event, WiFiEventInfo_t info)
     }
 }
 
-/* Log which backend IP DNS currently hands out for SERVER_HOST. A */
-/* "connection refused" with a healthy WiFi link and healthy heap points */
-/* at the remote end - logging the resolved IP lets repeated failures be */
-/* compared against successes to see whether they consistently land on a */
-/* different backend IP (e.g. round-robin/anycast DNS routing to a */
-/* server that isn't answering on 443, vs. it being genuinely random) */
-void log_resolved_server_ip(void)
+/* Resolve SERVER_HOST and report whether the result looks usable, logging */
+/* the outcome either way. Originally just diagnostic (comparing the */
+/* resolved backend IP between failing and succeeding uploads - round-robin/ */
+/* anycast DNS was ruled out this way early in this investigation), but */
+/* WiFi.hostByName() has a known quirk: it can return true (success) while */
+/* still writing an all-zero IPAddress if the underlying query effectively */
+/* timed out. Seen in the field as "resolves to 0.0.0.0" ~7s after */
+/* WiFi connected (itself right after an AUTH_EXPIRE reassociation blip), */
+/* immediately followed by every one of the real upload's 3 retries failing */
+/* with "read Timeout" - i.e. WL_CONNECTED doesn't guarantee the path past */
+/* the AP is actually healthy. Treat both a false return and an all-zero */
+/* result as unhealthy so callers can act on it, not just log it */
+bool wifi_check_dns_healthy(void)
 {
     IPAddress ip_resolved;
+    bool b_lookup_ok;
 
-    if (WiFi.hostByName(SERVER_HOST, ip_resolved))
+    b_lookup_ok = WiFi.hostByName(SERVER_HOST, ip_resolved);
+
+    if (b_lookup_ok && ip_resolved != IPAddress(0, 0, 0, 0))
     {
         Serial.printf("%s resolves to %s\r\n", SERVER_HOST, ip_resolved.toString().c_str());
+        return true;
     }
-    else
-    {
-        Serial.printf("DNS lookup failed for %s\r\n", SERVER_HOST);
-    }
+
+    Serial.printf("%s DNS check failed (resolved to %s)\r\n", SERVER_HOST, ip_resolved.toString().c_str());
+    return false;
 }
 
 /* Fully reset the WiFi radio's internal state. A plain WiFi.disconnect() */
@@ -499,7 +508,16 @@ bool wifi_connect_stored(void)
             delay(DELAY_100MS);
         }
 
-        /* Stop retrying as soon as we are connected */
+        /* Stop retrying as soon as we are connected AND the link can actually */
+        /* reach a DNS server - WL_CONNECTED only proves 802.11 association */
+        /* succeeded, not that the path past the AP is healthy. Seen in the */
+        /* field: a clean connect immediately followed by a DNS lookup that */
+        /* "succeeded" with 0.0.0.0, then every upload retry failing with */
+        /* "read Timeout" - see wifi_check_dns_healthy(). Treating that as a */
+        /* failed connection attempt (consuming one of these 5, forcing a */
+        /* fresh wifi_reset_radio()) gives it a chance to land on a healthier */
+        /* AP/path instead of handing send_to_server() a link that looks fine */
+        /* but isn't */
         if (WiFi.status() == WL_CONNECTED)
         {
             /* BSSID identifies the specific physical AP answered by "MIS" - */
@@ -509,10 +527,19 @@ bool wifi_connect_stored(void)
             /* so a recurring failure can be correlated to one BSSID */
             Serial.printf("WiFi connected, IP: %s, BSSID: %s, RSSI: %ld\r\n",
                           WiFi.localIP().toString().c_str(), WiFi.BSSIDstr().c_str(), (long)WiFi.RSSI());
-            return true;
+
+            if (wifi_check_dns_healthy())
+            {
+                return true;
+            }
+
+            Serial.printf("WiFi connected but DNS check failed - treating as a failed attempt\r\n");
+        }
+        else
+        {
+            Serial.printf("WiFi connection attempt %ld failed\r\n", i32_attempt);
         }
 
-        Serial.printf("WiFi connection attempt %ld failed\r\n", i32_attempt);
         /* Reset the radio before the next attempt - see wifi_reset_radio() */
         wifi_reset_radio();
 
@@ -613,8 +640,6 @@ void claim_device(void)
     str_url += url_encode(g_str_received_username);
     str_url += "&hash=";
     str_url += url_encode(g_str_received_password_hash);
-
-    log_resolved_server_ip();
 
     /* Retry like send_to_server() does - a single transient connection */
     /* failure shouldn't leave the device permanently unclaimed */
@@ -733,8 +758,6 @@ void send_to_server(int32_t i32_temperature, int32_t i32_pressure, int32_t i32_h
     str_url += String(i32_battery);
     str_url += "M";
     str_url += str_mac_hex;
-
-    log_resolved_server_ip();
 
     /* Retry the upload up to DATA_UPLOAD_RETRY_COUNT times - transient */
     /* failures like "connection refused" often succeed on the next try */
@@ -1078,17 +1101,22 @@ void wifi_connect_and_store(void)
             delay(DELAY_100MS);
         }
 
-        /* Stop retrying as soon as we are connected */
+        /* Stop retrying as soon as we are connected AND the link can actually */
+        /* reach a DNS server - see the matching gate + wifi_check_dns_healthy() */
+        /* in wifi_connect_stored() for why WL_CONNECTED alone isn't enough */
         if (WiFi.status() == WL_CONNECTED)
         {
-            break;
+            if (wifi_check_dns_healthy())
+            {
+                break;
+            }
+            Serial.printf("WiFi connected but DNS check failed - treating as a failed attempt\r\n");
         }
-
         /* WL_CONNECT_FAILED means the AP actively rejected the handshake */
         /* (wrong password) rather than just being unreachable - retrying */
         /* with the same credentials would only fail the same way again, */
         /* so give up immediately instead of burning the remaining attempts */
-        if (WiFi.status() == WL_CONNECT_FAILED)
+        else if (WiFi.status() == WL_CONNECT_FAILED)
         {
             Serial.printf("WiFi connection rejected (wrong password?) - not retrying\r\n");
             /* Reset the radio, not just disconnect - see wifi_reset_radio(). */
@@ -1098,12 +1126,18 @@ void wifi_connect_and_store(void)
             wifi_reset_radio();
             break;
         }
+        else
+        {
+            Serial.printf("WiFi connection attempt %ld failed\r\n", i32_attempt);
+        }
 
-        Serial.printf("WiFi connection attempt %ld failed\r\n", i32_attempt);
         /* Reset the radio before the next attempt - a plain disconnect() */
         /* is not enough here either (see wifi_reset_radio()), and also */
         /* avoids "sta is connecting, cannot set config" from starting a */
-        /* new WiFi.begin() while the previous attempt is still unwinding */
+        /* new WiFi.begin() while the previous attempt is still unwinding. */
+        /* Shared by both the "connected but DNS unhealthy" and plain */
+        /* "didn't connect" cases above - the WL_CONNECT_FAILED case already */
+        /* reset the radio and broke out before reaching here */
         wifi_reset_radio();
 
         /* Back off before retrying - see WIFI_RECONNECT_BACKOFF_BASE_MS definition */
