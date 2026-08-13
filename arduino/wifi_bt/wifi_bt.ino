@@ -1216,7 +1216,16 @@ void parse_measurement(String str_data)
     /* Confirm all four fields were successfully extracted */
     if (i32_parsed == PARSE_SUCCESS)
     {
-        Serial.printf("Temperature: %ld.%02ld C\r\n", i32_temperature / TEMP_SCALE, abs(i32_temperature % TEMP_SCALE));
+        /* Split display only, not the actual uploaded value - i32_temperature */
+        /* itself is signed and sent/parsed correctly end-to-end. But splitting */
+        /* it into integer + fraction parts for this log line loses the sign */
+        /* whenever the integer part truncates to exactly 0 (e.g. -57 -> "0.57", */
+        /* silently reading as +0.57C instead of -0.57C) since plain 0 has no */
+        /* separate negative representation - print the sign explicitly instead */
+        /* of relying on the integer part to carry it */
+        Serial.printf("Temperature: %s%ld.%02ld C\r\n",
+                      (i32_temperature < 0) ? "-" : "",
+                      abs(i32_temperature / TEMP_SCALE), abs(i32_temperature % TEMP_SCALE));
         Serial.printf("Pressure:    %ld Pa\r\n", i32_pressure);
         Serial.printf("Humidity:    %ld.%03ld %%\r\n", i32_humidity / HUM_SCALE, abs(i32_humidity % HUM_SCALE));
         Serial.printf("Battery:     %ld mV\r\n", i32_battery);
