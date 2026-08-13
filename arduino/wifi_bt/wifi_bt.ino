@@ -68,7 +68,29 @@
 #define WIFI_CONNECT_FAIL_GRACE_MS 3000u
 #define DATA_UPLOAD_RETRY_COUNT 3
 #define DATA_UPLOAD_RETRY_DELAY_MS 1000u
-#define DATA_UPLOAD_TIMEOUT_MS 8000u
+/* TCP connect + HTTP response read budget per attempt - NOT the TLS */
+/* handshake, which has its own separate, more generous budget below. */
+/* Splitting these out came from seeing "connection refused" 3/3 in the */
+/* field on a weak-but-usable link (RSSI ~-70dBm) with WiFi + DNS both */
+/* working - HTTPClient::errorToString(-1) prints "connection refused" */
+/* for ANY client->connect() failure, TLS handshake timeouts included, */
+/* so that message does not mean the server actually refused the TCP */
+/* connection. */
+#define DATA_UPLOAD_TIMEOUT_MS 10000u
+/* TLS handshake budget, seconds. A weak/marginal RSSI link (-70 to */
+/* -73dBm was enough to reproduce this) can need well over the previous */
+/* 8s clamp just for retransmission-heavy handshake round trips, even */
+/* though the link is otherwise perfectly usable once established - the */
+/* two other ESP32 sketches this board was compared against never */
+/* override the handshake timeout at all and don't show this failure */
+#define TLS_HANDSHAKE_TIMEOUT_S 20u
+/* Backoff between WiFi reconnect attempts (wifi_connect_stored() / */
+/* wifi_connect_and_store()). Retrying with only wifi_reset_radio()'s */
+/* 100ms gap looked like a deauth flood to at least one AP in the field - */
+/* it started rejecting the (correct, working-elsewhere) password with */
+/* AUTH_FAIL after a burst of rapid reconnects. Scaled by attempt number */
+/* so later retries back off further. */
+#define WIFI_RECONNECT_BACKOFF_BASE_MS 500u
 #define WIFI_MAX_NETWORKS   20
 #define CHUNK_DELIMITER     "\n"
 
@@ -309,6 +331,64 @@ void wifi_reset_radio(void)
     WiFi.setSleep(false);
 }
 
+/* Scan for every AP currently advertising str_ssid and report the strongest */
+/* one's BSSID/channel via the output parameters. Needed because "MIS" is */
+/* broadcast by more than one physical AP in the field (mesh nodes seen at */
+/* 30:DE:4B:B1:A5:0E and :10, both usually around -67 to -72dBm, alongside a */
+/* much stronger 9C:53:22:AC:7C:F2 at -40dBm) - a plain WiFi.begin(ssid, pass) */
+/* joins whichever one answers first, not necessarily the best one. Pinning */
+/* to a specific BSSID+channel via the WiFi.begin() overload below also lets */
+/* the driver skip the full-channel scan it would otherwise do during */
+/* association, so this isn't pure overhead. Returns false (output */
+/* parameters untouched) if the scan doesn't see str_ssid at all - callers */
+/* should fall back to a plain, unpinned WiFi.begin() in that case */
+bool wifi_find_strongest_bssid(const String &str_ssid, uint8_t *p_bssid_out, int32_t *pi32_channel_out, int32_t *pi32_rssi_out)
+{
+    int32_t i32_network_count;
+    int32_t i32_i;
+    bool b_found;
+    int32_t i32_best_rssi;
+
+    b_found = false;
+    i32_best_rssi = -1000;
+
+    Serial.printf("Scanning for strongest '%s' AP...\r\n", str_ssid.c_str());
+
+    i32_network_count = WiFi.scanNetworks();
+
+    for (i32_i = 0; i32_i < i32_network_count; i32_i++)
+    {
+        if (WiFi.SSID(i32_i) == str_ssid)
+        {
+            Serial.printf("  Candidate BSSID: %s, channel %ld, RSSI %ld\r\n",
+                          WiFi.BSSIDstr(i32_i).c_str(), (long)WiFi.channel(i32_i), (long)WiFi.RSSI(i32_i));
+
+            if (WiFi.RSSI(i32_i) > i32_best_rssi)
+            {
+                i32_best_rssi = WiFi.RSSI(i32_i);
+                memcpy(p_bssid_out, WiFi.BSSID(i32_i), 6);
+                *pi32_channel_out = WiFi.channel(i32_i);
+                *pi32_rssi_out = i32_best_rssi;
+                b_found = true;
+            }
+        }
+    }
+
+    /* Free the memory used by the scan results */
+    WiFi.scanDelete();
+
+    if (b_found)
+    {
+        Serial.printf("Strongest '%s' AP: RSSI %ld\r\n", str_ssid.c_str(), (long)i32_best_rssi);
+    }
+    else
+    {
+        Serial.printf("'%s' not seen in scan - falling back to unpinned connect\r\n", str_ssid.c_str());
+    }
+
+    return b_found;
+}
+
 /* Connect to WiFi using stored credentials from flash */
 /* Returns true if connected, false if failed or no credentials stored */
 bool wifi_connect_stored(void)
@@ -318,10 +398,17 @@ bool wifi_connect_stored(void)
     String str_pass;
     bool b_valid;
     int32_t i32_attempt;
+    uint8_t ui8_best_bssid[6];
+    int32_t i32_best_channel;
+    int32_t i32_best_rssi;
+    bool b_have_bssid;
 
     /* Initialise variables */
     ui32_timeout = 0;
     b_valid = false;
+    i32_best_channel = 0;
+    i32_best_rssi = 0;
+    b_have_bssid = false;
 
     /* Open flash storage in read-only mode */
     g_preferences.begin(PREF_NAMESPACE, true);
@@ -342,14 +429,19 @@ bool wifi_connect_stored(void)
     /* Close flash storage */
     g_preferences.end();
 
-    /* Set WiFi to station mode */
-    WiFi.mode(WIFI_STA);
-    /* Disable modem sleep - by default the radio drops into WIFI_PS_MIN_MODEM */
-    /* power-save between beacons right after associating, which can race the */
-    /* HTTPS connect() that follows immediately after WiFi.begin() succeeds on */
-    /* some AP/DTIM-interval combinations. Keeping it fully awake through the */
-    /* connect+upload sequence removes that race */
-    WiFi.setSleep(false);
+    /* Start from a known-clean radio state rather than just WiFi.mode(WIFI_STA) */
+    /* - see wifi_reset_radio(). Also disables modem sleep (by default the radio */
+    /* drops into WIFI_PS_MIN_MODEM power-save between beacons right after */
+    /* associating, which can race the HTTPS connect() that follows immediately */
+    /* after WiFi.begin() succeeds on some AP/DTIM-interval combinations; */
+    /* keeping it fully awake through the connect+upload sequence removes that */
+    /* race) */
+    wifi_reset_radio();
+
+    /* Find the strongest AP currently advertising this SSID - see */
+    /* wifi_find_strongest_bssid(). Done once per call, not per retry - */
+    /* rescanning every attempt would multiply an already several-second cost */
+    b_have_bssid = wifi_find_strongest_bssid(str_ssid, ui8_best_bssid, &i32_best_channel, &i32_best_rssi);
 
     /* Retry the connection attempt up to WIFI_CONNECT_RETRY_COUNT times */
     /* before giving up, since a single failed attempt is often transient */
@@ -358,17 +450,41 @@ bool wifi_connect_stored(void)
         Serial.printf("Connecting to stored WiFi: %s (attempt %ld/%d)\r\n",
                       str_ssid.c_str(), i32_attempt, WIFI_CONNECT_RETRY_COUNT);
 
-        /* Begin the connection attempt */
-        WiFi.begin(str_ssid.c_str(), str_pass.c_str());
+        /* Pin to the strongest known BSSID/channel if the scan found one - */
+        /* see wifi_find_strongest_bssid() - otherwise fall back to letting */
+        /* the driver join whichever AP answers first, same as before */
+        if (b_have_bssid)
+        {
+            WiFi.begin(str_ssid.c_str(), str_pass.c_str(), i32_best_channel, ui8_best_bssid);
+        }
+        else
+        {
+            WiFi.begin(str_ssid.c_str(), str_pass.c_str());
+        }
 
         /* Record the start time */
         ui32_timeout = millis();
 
-        /* Wait for connection or timeout */
+        /* Wait for connection, a definitive rejection, or timeout - same */
+        /* reasoning as wifi_connect_and_store(). Without the WL_CONNECT_FAILED */
+        /* check, an AP that actively rejects the handshake (seen in the field */
+        /* as a burst of AUTH_EXPIRE/ASSOC_EXPIRE/4WAY_HANDSHAKE_TIMEOUT/AUTH_FAIL */
+        /* disconnect events within the first couple seconds) still burns the */
+        /* full WIFI_DATA_TIMEOUT doing nothing on every one of the 5 attempts. */
+        /* Unlike wifi_connect_and_store(), this does NOT give up the whole retry */
+        /* loop on WL_CONNECT_FAILED - these are stored, previously-working */
+        /* credentials, so a rejection here is far more likely a transient/AP-side */
+        /* thing than a suddenly-wrong password, and retrying (with the backoff */
+        /* below) is the right response rather than abandoning the upload */
         while (WiFi.status() != WL_CONNECTED)
         {
-            /* Check if timeout expired */
-            if ((millis() - ui32_timeout) >= WIFI_DATA_TIMEOUT)
+            uint32_t ui32_elapsed = millis() - ui32_timeout;
+
+            if (ui32_elapsed >= WIFI_DATA_TIMEOUT)
+            {
+                break;
+            }
+            if (ui32_elapsed >= WIFI_CONNECT_FAIL_GRACE_MS && WiFi.status() == WL_CONNECT_FAILED)
             {
                 break;
             }
@@ -391,6 +507,12 @@ bool wifi_connect_stored(void)
         Serial.printf("WiFi connection attempt %ld failed\r\n", i32_attempt);
         /* Reset the radio before the next attempt - see wifi_reset_radio() */
         wifi_reset_radio();
+
+        /* Back off before retrying - see WIFI_RECONNECT_BACKOFF_BASE_MS definition */
+        if (i32_attempt < WIFI_CONNECT_RETRY_COUNT)
+        {
+            delay(WIFI_RECONNECT_BACKOFF_BASE_MS * i32_attempt + random(0, 300));
+        }
     }
 
     Serial.printf("WiFi connection failed for data upload after %d attempts\r\n", WIFI_CONNECT_RETRY_COUNT);
@@ -499,7 +621,10 @@ void claim_device(void)
         /* Skip certificate verification for now */
         /* Production should use a root CA certificate */
         wifi_client.setInsecure();
-        wifi_client.setHandshakeTimeout(DATA_UPLOAD_TIMEOUT_MS / 1000u);
+        /* See TLS_HANDSHAKE_TIMEOUT_S definition - kept separate from the */
+        /* connect/response budget below so a slow-but-fine handshake on a */
+        /* weak link isn't mistaken for a dead connection */
+        wifi_client.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_S);
 
         if (http_client.begin(wifi_client, str_url))
         {
@@ -616,8 +741,9 @@ void send_to_server(int32_t i32_temperature, int32_t i32_pressure, int32_t i32_h
         /* Skip certificate verification for now */
         /* Production should use a root CA certificate */
         wifi_client.setInsecure();
-        /* Bound the TLS handshake so a stalled connection can't hang past this */
-        wifi_client.setHandshakeTimeout(DATA_UPLOAD_TIMEOUT_MS / 1000u);
+        /* Bound the TLS handshake, but with its own more generous budget - */
+        /* see TLS_HANDSHAKE_TIMEOUT_S definition */
+        wifi_client.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_S);
 
         /* Begin the HTTPS connection */
         if (http_client.begin(wifi_client, str_url))
@@ -860,6 +986,14 @@ void wifi_connect_and_store(void)
     int32_t i32_attempt;
     String str_ssid;
     String str_pass;
+    uint8_t ui8_best_bssid[6];
+    int32_t i32_best_channel;
+    int32_t i32_best_rssi;
+    bool b_have_bssid;
+
+    i32_best_channel = 0;
+    i32_best_rssi = 0;
+    b_have_bssid = false;
 
     /* Snapshot the credentials this call is connecting with. The phone can */
     /* write a new credential over BLE at any time, including while this */
@@ -877,10 +1011,19 @@ void wifi_connect_and_store(void)
     /* Notify the phone that connection is being attempted */
     send_status("CONNECTING");
 
-    /* Set WiFi to station mode */
-    WiFi.mode(WIFI_STA);
-    /* See the setSleep(false) note in wifi_connect_stored() */
-    WiFi.setSleep(false);
+    /* Start from a known-clean radio state rather than just WiFi.mode(WIFI_STA) */
+    /* - see wifi_reset_radio(). Particularly relevant here: wifi_scan_and_send() */
+    /* normally just ran on this same BLE session (the phone scans before */
+    /* sending credentials), leaving the radio in a post-scan state right */
+    /* before this connect attempt - exactly the "brand new BLE session" */
+    /* scenario wifi_reset_radio()'s own comment calls out */
+    wifi_reset_radio();
+
+    /* Find the strongest AP currently advertising this SSID - see */
+    /* wifi_find_strongest_bssid(). Same reasoning as wifi_connect_stored(): */
+    /* a plain WiFi.begin(ssid, pass) joins whichever AP answers first, which */
+    /* can be a weak mesh node even when a much stronger one is in range */
+    b_have_bssid = wifi_find_strongest_bssid(str_ssid, ui8_best_bssid, &i32_best_channel, &i32_best_rssi);
 
     /* Retry the connection attempt up to WIFI_CONNECT_RETRY_COUNT times */
     /* before giving up, since a single failed attempt is often transient */
@@ -889,8 +1032,17 @@ void wifi_connect_and_store(void)
         Serial.printf("Connecting to '%s' (attempt %ld/%d)...\r\n",
                       str_ssid.c_str(), i32_attempt, WIFI_CONNECT_RETRY_COUNT);
 
-        /* Begin the connection attempt with the received credentials */
-        WiFi.begin(str_ssid.c_str(), str_pass.c_str());
+        /* Pin to the strongest known BSSID/channel if the scan found one - */
+        /* see wifi_find_strongest_bssid() - otherwise fall back to letting */
+        /* the driver join whichever AP answers first, same as before */
+        if (b_have_bssid)
+        {
+            WiFi.begin(str_ssid.c_str(), str_pass.c_str(), i32_best_channel, ui8_best_bssid);
+        }
+        else
+        {
+            WiFi.begin(str_ssid.c_str(), str_pass.c_str());
+        }
 
         /* Record the start time for timeout detection */
         ui32_timeout = millis();
@@ -945,6 +1097,12 @@ void wifi_connect_and_store(void)
         /* avoids "sta is connecting, cannot set config" from starting a */
         /* new WiFi.begin() while the previous attempt is still unwinding */
         wifi_reset_radio();
+
+        /* Back off before retrying - see WIFI_RECONNECT_BACKOFF_BASE_MS definition */
+        if (i32_attempt < WIFI_CONNECT_RETRY_COUNT)
+        {
+            delay(WIFI_RECONNECT_BACKOFF_BASE_MS * i32_attempt + random(0, 300));
+        }
     }
 
     /* If still not connected after all retries, report failure */
