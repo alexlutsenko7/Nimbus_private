@@ -8,14 +8,22 @@
 #include <HTTPClient.h>
 #include <esp_mac.h>
 
+/* Route all debug/diagnostic output (every Serial.printf/.begin/.available */
+/* call in this file) through the hardware UART on RX_PIN/TX_PIN (D7/D6) */
+/* instead of the native USB CDC console, so logs stay visible via an */
+/* external USB-UART adapter wired to TX_PIN while the board itself runs */
+/* untethered from any PC USB port - needed for battery-only testing, where */
+/* no USB cable is connected at all. Only rewrites the token "Serial", not */
+/* "Serial1", so the STM32-link code below (Serial1.available()/.read() in */
+/* loop()) is unaffected - same pattern already used in the sibling */
+/* WifiClient_seeduino_esp32s3.ino sketch (#define Serial Serial0 there) */
+#define Serial Serial1
+
 /* Pin definitions */
 #define RX_PIN              D7
 #define TX_PIN              D6
 #define READY_PIN           D5
 #define UART_BAUD           9600
-#define UARTUSB_BAUD        115200
-#define UART_INIT_TIME      200u
-#define DELAY_10MS          10u
 #define DELAY_100MS         100u
 #define DELAY_300MS         300u
 #define PARSE_FIELD_COUNT   4
@@ -1201,9 +1209,6 @@ void parse_measurement(String str_data)
 
 void setup()
 {
-    uint32_t ui32_timeout;
-    ui32_timeout = 0;
-
     /* Initialise the BLE active flag */
     g_b_ble_active = false;
     /* Initialise all BLE communication flags */
@@ -1225,22 +1230,16 @@ void setup()
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, LOW);
 
-    /* Standard serial port via the USB, it might be available (USB connected) or not */
-    Serial.begin(UARTUSB_BAUD);
-    /* Wait for USB serial with timeout - continues without it on battery power */
-    ui32_timeout = millis();
-    while (!Serial && ((millis() - ui32_timeout) < UART_INIT_TIME))
-    {
-        delay(DELAY_10MS);
-    }
-
-    /* Hardware UART for STM32 communication - no ready check needed */
-    Serial1.begin(UART_BAUD, SERIAL_8N1, RX_PIN, TX_PIN);
+    /* Debug UART + STM32 link share this one physical port (see the */
+    /* #define Serial Serial1 above), so it has to run at the STM32's fixed */
+    /* UART_BAUD (9600) rather than a faster debug-only rate - an external */
+    /* USB-UART adapter reading TX_PIN just needs to be set to 9600 8N1 */
+    Serial.begin(UART_BAUD, SERIAL_8N1, RX_PIN, TX_PIN);
     /* Flush any bootloader garbage sitting in RX buffer */
     delay(DELAY_100MS);
-    while (Serial1.available())
+    while (Serial.available())
     {
-        Serial1.read();
+        Serial.read();
     }
 
     /* Log the specific reason for every WiFi disconnect (see */
@@ -1248,7 +1247,7 @@ void setup()
     /* apart from "wrong password" apart from "signal dropped mid-connect" */
     WiFi.onEvent(wifi_event_handler);
 
-    Serial.printf("UART to USB is initialized\r\n");
+    Serial.printf("Debug UART initialized\r\n");
 }
 
 void loop()
