@@ -58,10 +58,12 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 /* Compose runtime and state management imports */
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 /* Compose UI styling and positioning imports */
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -184,6 +186,10 @@ class MainActivity : ComponentActivity() {
     /* Set true by the WebView error handler, cleared when a page loads */
     private val showNoInternet = mutableStateOf(false)
 
+    /* True until the dashboard's first page load finishes - shows "Loading..." */
+    /* in place of the blank WebView instead of an empty/white gap */
+    private val isPageLoading = mutableStateOf(true)
+
     /*
      * Permission launcher - registered with the activity result API.
      * When the system permission dialog closes, this callback checks
@@ -213,16 +219,21 @@ class MainActivity : ComponentActivity() {
         }
 
     /*
-     * Called when the activity resumes from background.
-     * Forces a fresh load of the dashboard URL to avoid showing
-     * stale data or a cached error page after the phone was idle.
+     * Called when the activity resumes from background - this fires on
+     * every screen wake/unlock too, not just after being truly backgrounded,
+     * since Android pauses/resumes the foreground activity around screen
+     * off/on. The dashboard page already auto-refreshes itself every 10s
+     * (see index.php's meta refresh), so a forced reload here is only
+     * needed to escape a stuck "no internet" error page - doing it
+     * unconditionally instead re-fetches the whole page over the network
+     * on every wake, which is what caused the multi-second white flash.
      * Uses loadUrl instead of reload because reload on an error
      * page just reloads the error, not the original URL.
      */
     override fun onResume() {
         super.onResume()
-        /* Only reload if we are on the dashboard screen */
-        if (currentScreen.value == "dashboard")
+        /* Only force a reload if we're stuck showing the offline overlay */
+        if (currentScreen.value == "dashboard" && showNoInternet.value)
         {
             /* Force a fresh navigation to the dashboard URL */
             dashboardWebView?.loadUrl(dashboardUrl)
@@ -274,8 +285,13 @@ class MainActivity : ComponentActivity() {
                             onAddSensor = { requestSensorPermissions() },
                             onWebViewCreated = { dashboardWebView = it },
                             noInternet = showNoInternet.value,
+                            isLoading = isPageLoading.value,
                             onNetworkError = { showNoInternet.value = true },
-                            onPageLoaded = { showNoInternet.value = false }
+                            onLoadStarted = { isPageLoading.value = true },
+                            onPageLoaded = {
+                                showNoInternet.value = false
+                                isPageLoading.value = false
+                            }
                         )
                         /* BLE scan screen - shows discovered Weather station devices */
                         "scan" -> ScanScreen(
@@ -1045,7 +1061,9 @@ fun AppScreen(
     onAddSensor: () -> Unit,
     onWebViewCreated: (WebView) -> Unit,
     noInternet: Boolean,
+    isLoading: Boolean,
     onNetworkError: () -> Unit,
+    onLoadStarted: () -> Unit,
     onPageLoaded: () -> Unit
 ) {
     /* Box allows stacking the overlay and button on top of the WebView */
@@ -1056,8 +1074,38 @@ fun AppScreen(
             factory = { context ->
                 /* Create the WebView instance */
                 WebView(context).apply {
+                    /* WebView paints white by default until the page's own */
+                    /* CSS background applies - match the dashboard's dark */
+                    /* theme so any load-in-progress gap is dark, not a flash */
+                    /* of white (same color as the offline placeholder page) */
+                    setBackgroundColor(android.graphics.Color.parseColor("#0e1419"))
                     /* Set up the WebView client with error handling */
                     webViewClient = object : WebViewClient() {
+                        /*
+                         * WebView still calls onPageFinished with the original URL
+                         * after a FAILED navigation, right after the error handler
+                         * fires - so onPageFinished can't tell success from failure
+                         * from the URL alone. Set by the error handlers below, checked
+                         * (and reset) in onPageFinished so a failed load's callback
+                         * doesn't immediately clear the offline overlay it just set.
+                         */
+                        private var lastLoadFailed = false
+
+                        /*
+                         * Called at the start of every navigation, including the
+                         * periodic meta-refresh reload the dashboard page does on
+                         * its own every 10s. Re-arms the loading state so a slow
+                         * reload (e.g. right after the phone wakes from idle) can
+                         * show "Loading..." again, not just on the very first load.
+                         */
+                        override fun onPageStarted(view: WebView?, startedUrl: String?, favicon: android.graphics.Bitmap?) {
+                            if (startedUrl != null && startedUrl.startsWith("http"))
+                            {
+                                lastLoadFailed = false
+                                onLoadStarted()
+                            }
+                        }
+
                         /*
                          * Deprecated error handler - catches connection-level errors
                          * like ERR_CONNECTION_ABORTED and ERR_NAME_NOT_RESOLVED.
@@ -1070,6 +1118,7 @@ fun AppScreen(
                             description: String?,
                             failingUrl: String?
                         ) {
+                            lastLoadFailed = true
                             /* Replace Chrome's white error page with dark blank */
                             /* Background color matches the dashboard theme */
                             view?.loadData(
@@ -1087,6 +1136,44 @@ fun AppScreen(
                         }
 
                         /*
+                         * Modern connection-error handler (API 23+). Catches the same
+                         * class of errors as the deprecated onReceivedError above
+                         * (ERR_INTERNET_DISCONNECTED, ERR_NAME_NOT_RESOLVED, etc), but
+                         * which of the two actually fires for a given failure is
+                         * inconsistent across devices/WebView versions - e.g. a total
+                         * offline failure (airplane mode) can be reported only through
+                         * this overload on some devices, leaving the deprecated one
+                         * silent. Without this override, WebView still calls
+                         * onPageFinished with the original URL despite the failed
+                         * load, which cleared the loading state with no offline
+                         * overlay ever shown - just a blank screen. Overriding both
+                         * closes that gap regardless of which path a given device uses.
+                         */
+                        override fun onReceivedError(
+                            view: WebView?,
+                            request: android.webkit.WebResourceRequest?,
+                            error: android.webkit.WebResourceError?
+                        ) {
+                            /* Only handle main page errors */
+                            if (request?.isForMainFrame == true)
+                            {
+                                lastLoadFailed = true
+                                /* Replace Chrome's white error page with dark blank */
+                                view?.loadData(
+                                    "<html><body style='background:#0e1419'></body></html>",
+                                    "text/html",
+                                    "UTF-8"
+                                )
+                                /* Show the "No internet" overlay */
+                                onNetworkError()
+                                /* Schedule automatic retry after 5 seconds */
+                                view?.postDelayed({
+                                    view.loadUrl(url)
+                                }, 5000)
+                            }
+                        }
+
+                        /*
                          * Catches HTTP-level errors (4xx, 5xx responses).
                          * Only handles main frame errors, not subresources.
                          */
@@ -1098,6 +1185,7 @@ fun AppScreen(
                             /* Only handle main page errors */
                             if (request?.isForMainFrame == true)
                             {
+                                lastLoadFailed = true
                                 /* Show the "No internet" overlay */
                                 onNetworkError()
                                 /* Retry after 5 seconds */
@@ -1108,13 +1196,14 @@ fun AppScreen(
                         }
 
                         /*
-                         * Called when any page finishes loading.
-                         * Clears the error overlay only for real dashboard pages,
-                         * not for the dark blank placeholder.
+                         * Called when any page finishes loading - including a page
+                         * that just failed to load, with the original URL still
+                         * passed in (see lastLoadFailed above). Clears the error
+                         * overlay only for a real, successfully-loaded dashboard page.
                          */
                         override fun onPageFinished(view: WebView?, finishedUrl: String?) {
-                            /* Only clear error for real HTTP/HTTPS URLs */
-                            if (finishedUrl != null && finishedUrl.startsWith("http"))
+                            /* Only clear error for real HTTP/HTTPS URLs that actually loaded */
+                            if (finishedUrl != null && finishedUrl.startsWith("http") && !lastLoadFailed)
                             {
                                 /* Dashboard loaded - hide the overlay */
                                 onPageLoaded()
@@ -1134,6 +1223,37 @@ fun AppScreen(
                 }
             }
         )
+
+        /* "Loading..." overlay - shown while a page load is in progress, so */
+        /* the WebView's blank/dark gap during a slow load (e.g. right after */
+        /* the phone wakes from idle) shows text instead. Re-armed on every */
+        /* navigation (see onPageStarted), not just the very first load - the */
+        /* dashboard's own 10s meta-refresh (index.php) re-navigates on its */
+        /* own even while the app just sits there. That routine refresh is */
+        /* normally fast enough to be invisible - delay showing the text by */
+        /* 500ms so only a load that's actually slow (the wake-from-idle */
+        /* case) shows it, instead of a blink on every 10s cycle. */
+        var showLoadingText by remember { mutableStateOf(false) }
+        LaunchedEffect(isLoading) {
+            if (isLoading) {
+                delay(500)
+                showLoadingText = true
+            } else {
+                showLoadingText = false
+            }
+        }
+        if (showLoadingText && !noInternet) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    "Loading...",
+                    color = Color(0xFF7D8B99),
+                    fontSize = 16.sp
+                )
+            }
+        }
 
         /* "No internet connection" overlay - shown when network is down */
         if (noInternet) {

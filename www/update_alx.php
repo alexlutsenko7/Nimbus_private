@@ -9,13 +9,14 @@ header('Cache-Control: no-cache, no-store, must-revalidate');
 header('Pragma: no-cache');
 header('Expires: 0');
 
-/* parse the query string: T2334H6722P98823B3294MD83BDA75F32C011 */
+/* parse the query string: T2334H6722P98823B3294S-65MD83BDA75F32C011 */
+/* S is the WiFi RSSI in dBm (negative) at upload time */
 /* M is the 9-byte device id (6 bytes WiFi MAC + 3 bytes BT MAC), hex-encoded */
 /* - the same id update_alx_setup.php registered in the devices table */
 $raw = $_SERVER['QUERY_STRING'];
-$match_count = preg_match('/T(-?\d+)H(\d+)P(\d+)B(\d+)M([0-9A-Fa-f]{18})/', $raw, $matches);
+$match_count = preg_match('/T(-?\d+)H(\d+)P(\d+)B(\d+)S(-?\d+)M([0-9A-Fa-f]{18})/', $raw, $matches);
 
-/* validate that all five fields were found */
+/* validate that all six fields were found */
 if ($match_count !== 1)
 {
     http_response_code(400);
@@ -28,7 +29,8 @@ $temperature = intval($matches[1]);
 $humidity    = intval($matches[2]);
 $pressure    = intval($matches[3]);
 $battery     = intval($matches[4]);
-$mac_hex     = strtoupper($matches[5]);
+$wifi_signal = intval($matches[5]);
+$mac_hex     = strtoupper($matches[6]);
 $mac_binary  = hex2bin($mac_hex);
 
 /* build the reading record */
@@ -37,6 +39,7 @@ $record = array(
     'humidity'    => $humidity,
     'pressure'   => $pressure,
     'battery'    => $battery,
+    'wifi_signal' => $wifi_signal,
     'timestamp'  => gmdate('Y-m-d H:i:s'),
     'ip'         => $_SERVER['REMOTE_ADDR']
 );

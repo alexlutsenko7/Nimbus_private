@@ -662,6 +662,7 @@ $temp_val = '--';
 $press_val = '--';
 $hum_val = '--';
 $batt_val = '--';
+$wifi_val = '';
 $timestamp = 'No data received yet';
 $source_ip = '';
 $batt_class = '';
@@ -703,6 +704,10 @@ if ($mysqli !== null)
                     $hum_val = number_format($d['humidity'] / 1000, 2);
                     /* battery: stored in mV */
                     $batt_val = $d['battery'];
+                    /* wifi_signal: dBm, missing on readings from before this */
+                    /* field existed - leave $wifi_val blank rather than 0 so */
+                    /* an old reading doesn't render a fake "0dBm" */
+                    $wifi_val = isset($d['wifi_signal']) ? $d['wifi_signal'] . 'dBm' : '';
 
                     /* timestamp from the server - convert to Toronto local time */
                     $utc_time = new DateTime($d['timestamp'], new DateTimeZone('UTC'));
@@ -1021,8 +1026,8 @@ if ($mysqli !== null)
             </div>
 
             <div class="reading battery">
-                <div class="label">Battery</div>
-                <div class="value<?php echo $batt_class; ?>"><?php echo $batt_val; ?><span class="unit">mV</span></div>
+                <div class="label">Battery/Signal</div>
+                <div class="value<?php echo $batt_class; ?>"><?php echo $batt_val; ?>mV<?php if ($wifi_val !== ''): ?>/<?php echo htmlspecialchars($wifi_val); ?><?php endif; ?></div>
             </div>
         </div>
 

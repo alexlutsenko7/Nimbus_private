@@ -46,6 +46,14 @@ try
 
     if ($found && hash_equals($db_hash, $hash))
     {
+        /* one device per account - releasing any device(s) this user */
+        /* previously owned so it goes back to unclaimed (user_id = 0) */
+        /* instead of staying attributed to an account that moved on */
+        $release = $mysqli->prepare('UPDATE devices SET user_id = 0 WHERE user_id = ? AND device_number != ?');
+        $release->bind_param('is', $user_id, $mac_binary);
+        $release->execute();
+        $release->close();
+
         /* created_at now doubles as "last claimed at" - bind an explicit */
         /* PHP-generated UTC value (same as update_alx.php's gmdate() for */
         /* last_reading) rather than MySQL's NOW(), which is stored/read in */

@@ -740,11 +740,15 @@ void send_to_server(int32_t i32_temperature, int32_t i32_pressure, int32_t i32_h
     String str_url;
     int32_t i32_response_code;
     int32_t i32_attempt;
+    int32_t i32_rssi;
     char str_mac_hex[DEVICE_MAC_HEX_LEN + 1];
 
     /* Initialise variables */
     i32_response_code = 0;
     get_device_mac_hex(str_mac_hex);
+    /* current link strength, dBm (negative) - read now since it's only */
+    /* meaningful right after wifi_connect_stored() brought the radio up */
+    i32_rssi = WiFi.RSSI();
 
     /* Build the URL with measurement data as query parameter */
     str_url = DATA_URL;
@@ -756,6 +760,8 @@ void send_to_server(int32_t i32_temperature, int32_t i32_pressure, int32_t i32_h
     str_url += String(i32_pressure);
     str_url += "B";
     str_url += String(i32_battery);
+    str_url += "S";
+    str_url += String(i32_rssi);
     str_url += "M";
     str_url += str_mac_hex;
 
