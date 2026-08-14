@@ -190,6 +190,12 @@ class MainActivity : ComponentActivity() {
     /* in place of the blank WebView instead of an empty/white gap */
     private val isPageLoading = mutableStateOf(true)
 
+    /* Bumped on every onResume - lets AppScreen re-arm the offline overlay's */
+    /* debounce on wake, so a "no internet" state left over from before the */
+    /* phone slept doesn't reappear instantly; it gets the same fresh grace */
+    /* period a brand new failure would, while the resume retry (below) runs */
+    private val resumeSignal = mutableStateOf(0)
+
     /*
      * Permission launcher - registered with the activity result API.
      * When the system permission dialog closes, this callback checks
@@ -232,6 +238,8 @@ class MainActivity : ComponentActivity() {
      */
     override fun onResume() {
         super.onResume()
+        /* Give the offline overlay's debounce a fresh start on every wake */
+        resumeSignal.value++
         /* Only force a reload if we're stuck showing the offline overlay */
         if (currentScreen.value == "dashboard" && showNoInternet.value)
         {
@@ -286,6 +294,7 @@ class MainActivity : ComponentActivity() {
                             onWebViewCreated = { dashboardWebView = it },
                             noInternet = showNoInternet.value,
                             isLoading = isPageLoading.value,
+                            resumeSignal = resumeSignal.value,
                             onNetworkError = { showNoInternet.value = true },
                             onLoadStarted = { isPageLoading.value = true },
                             onPageLoaded = {
@@ -1062,6 +1071,7 @@ fun AppScreen(
     onWebViewCreated: (WebView) -> Unit,
     noInternet: Boolean,
     isLoading: Boolean,
+    resumeSignal: Int,
     onNetworkError: () -> Unit,
     onLoadStarted: () -> Unit,
     onPageLoaded: () -> Unit
@@ -1230,9 +1240,15 @@ fun AppScreen(
         /* showing the offline overlay by 500ms rather than reacting instantly. */
         /* The actual retry logic (WebViewClient's postDelayed reload) is */
         /* unaffected - this only debounces what's displayed. */
+        /* Also keyed on resumeSignal (bumped every onResume): a "no internet" */
+        /* state left over from before the phone slept must not just stay */
+        /* visible across the wake with no debounce - it's hidden and given */
+        /* the same fresh 500ms grace period as a brand new failure, while */
+        /* MainActivity's onResume kicks off a retry in the background. */
         var showOfflineOverlay by remember { mutableStateOf(false) }
-        LaunchedEffect(noInternet) {
+        LaunchedEffect(noInternet, resumeSignal) {
             if (noInternet) {
+                showOfflineOverlay = false
                 delay(500)
                 showOfflineOverlay = true
             } else {
