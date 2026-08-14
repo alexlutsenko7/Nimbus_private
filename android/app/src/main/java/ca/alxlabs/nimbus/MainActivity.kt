@@ -1224,6 +1224,22 @@ fun AppScreen(
             }
         )
 
+        /* Debounced offline state - a spurious noInternet blip can happen right */
+        /* after wakeup even when the connection is actually fine (e.g. the OS */
+        /* reports connectivity a moment before it's really usable), so delay */
+        /* showing the offline overlay by 500ms rather than reacting instantly. */
+        /* The actual retry logic (WebViewClient's postDelayed reload) is */
+        /* unaffected - this only debounces what's displayed. */
+        var showOfflineOverlay by remember { mutableStateOf(false) }
+        LaunchedEffect(noInternet) {
+            if (noInternet) {
+                delay(500)
+                showOfflineOverlay = true
+            } else {
+                showOfflineOverlay = false
+            }
+        }
+
         /* "Loading..." overlay - shown while a page load is in progress, so */
         /* the WebView's blank/dark gap during a slow load (e.g. right after */
         /* the phone wakes from idle) shows text instead. Re-armed on every */
@@ -1242,7 +1258,7 @@ fun AppScreen(
                 showLoadingText = false
             }
         }
-        if (showLoadingText && !noInternet) {
+        if (showLoadingText && !showOfflineOverlay) {
             Box(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
@@ -1256,7 +1272,7 @@ fun AppScreen(
         }
 
         /* "No internet connection" overlay - shown when network is down */
-        if (noInternet) {
+        if (showOfflineOverlay) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -1293,7 +1309,7 @@ fun AppScreen(
         }
 
         /* "Add sensor" button - only shown when internet is available */
-        if (!noInternet) {
+        if (!showOfflineOverlay) {
             ExtendedFloatingActionButton(
                 text = { Text("Add sensor") },
                 icon = { },
