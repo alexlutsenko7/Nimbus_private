@@ -8,16 +8,14 @@
 #include <HTTPClient.h>
 #include <esp_mac.h>
 
-/* Route all debug/diagnostic output (every Serial.printf/.begin/.available */
-/* call in this file) through the hardware UART on RX_PIN/TX_PIN (D7/D6) */
-/* instead of the native USB CDC console, so logs stay visible via an */
-/* external USB-UART adapter wired to TX_PIN while the board itself runs */
+/* All debug/diagnostic logging in this file calls Serial1 explicitly (not */
+/* a "Serial" macro alias) - it goes out the hardware UART on RX_PIN/TX_PIN */
+/* (D7/D6) instead of the native USB CDC console, so logs stay visible via */
+/* an external USB-UART adapter wired to TX_PIN while the board itself runs */
 /* untethered from any PC USB port - needed for battery-only testing, where */
-/* no USB cable is connected at all. Only rewrites the token "Serial", not */
-/* "Serial1", so the STM32-link code below (Serial1.available()/.read() in */
-/* loop()) is unaffected - same pattern already used in the sibling */
-/* WifiClient_seeduino_esp32s3.ino sketch (#define Serial Serial0 there) */
-#define Serial Serial1
+/* no USB cable is connected at all. This leaves the real "Serial" object */
+/* (the chip's native USB CDC port) completely unshadowed, so */
+/* print_device_id_over_usb() below can use it directly with no indirection */
 
 /* Pin definitions */
 #define RX_PIN              D7
@@ -26,6 +24,16 @@
 #define UART_BAUD           9600
 #define DELAY_100MS         100u
 #define DELAY_300MS         300u
+/* Fixed settle delay after native USB CDC begin() before writing to it, */
+/* in setup() - see print_device_id_over_usb() */
+#define USB_CONNECT_WAIT_MS 3000u
+/* Input, pull-up. Gates print_device_id_over_usb() (see setup()) so */
+/* normal boots don't pay its USB_CONNECT_WAIT_MS wait: left floating (or */
+/* pulled high), it reads HIGH and native USB is skipped entirely; tied to */
+/* GND (e.g. a jumper), it reads LOW and native USB is initialised and the */
+/* device id is printed. Ordinary GPIO, not a boot-strap pin like GPIO0, */
+/* so its state at reset/power-up doesn't affect how the chip boots */
+#define USB_UART_SELECT_PIN D0
 #define PARSE_FIELD_COUNT   4
 #define PARSE_SUCCESS       4
 #define TEMP_SCALE          100
@@ -39,6 +47,11 @@
 #define DEVICE_MAC_BT_LEN   3
 #define DEVICE_MAC_LEN      (DEVICE_MAC_WIFI_LEN + DEVICE_MAC_BT_LEN)
 #define DEVICE_MAC_HEX_LEN  (DEVICE_MAC_LEN * 2)
+
+/* Fixed 5-byte sync marker printed over native USB ahead of the 9 raw */
+/* device-id bytes (see print_device_id_over_usb()), so a host-side tool */
+/* reading the raw USB CDC stream can find where the id packet starts */
+static const uint8_t g_ui8_usb_id_magic[] = {0xC0, 0xBE, 0xC0, 0xB0, 0xB0};
 
 /* Hostname shared by DATA_URL and CLAIM_URL below, used to log which */
 /* backend IP DNS handed us on each upload - see wifi_check_dns_healthy() */
@@ -153,14 +166,14 @@ class NimbusServerCallbacks : public BLEServerCallbacks
     {
         /* Set the connected flag */
         g_b_client_connected = true;
-        Serial.printf("BLE client connected\r\n");
+        Serial1.printf("BLE client connected\r\n");
     }
 
     void onDisconnect(BLEServer *pServer)
     {
         /* Clear the connected flag */
         g_b_client_connected = false;
-        Serial.printf("BLE client disconnected\r\n");
+        Serial1.printf("BLE client disconnected\r\n");
 
         /* Only now tell the STM32 the setup session is actually over. */
         /* READY_PIN going low is what wakes ConfirmComm()'s wait out of */
@@ -183,7 +196,7 @@ class CommandCallbacks : public BLECharacteristicCallbacks
         str_value = pCharacteristic->getValue().c_str();
         str_value.trim();
 
-        Serial.printf("Command received: %s\r\n", str_value.c_str());
+        Serial1.printf("Command received: %s\r\n", str_value.c_str());
 
         /* Check if the command is a wifi scan request */
         if (str_value == "SCAN")
@@ -206,7 +219,7 @@ class CredentialCallbacks : public BLECharacteristicCallbacks
         str_value = pCharacteristic->getValue().c_str();
         str_value.trim();
 
-        Serial.printf("Credential received: %s\r\n", str_value.c_str());
+        Serial1.printf("Credential received: %s\r\n", str_value.c_str());
 
         /* Find the pipe separator between ssid and password */
         i32_separator = str_value.indexOf('|');
@@ -221,8 +234,8 @@ class CredentialCallbacks : public BLECharacteristicCallbacks
             /* Set the flag so the main loop handles the connection attempt */
             g_b_credential_received = true;
 
-            Serial.printf("SSID: %s\r\n", g_str_received_ssid.c_str());
-            Serial.printf("Pass length: %d\r\n", g_str_received_pass.length());
+            Serial1.printf("SSID: %s\r\n", g_str_received_ssid.c_str());
+            Serial1.printf("Pass length: %d\r\n", g_str_received_pass.length());
         }
         else
         {
@@ -259,7 +272,7 @@ class UserCredentialCallbacks : public BLECharacteristicCallbacks
             g_str_received_password_hash = str_value.substring(i32_separator + 1);
             g_b_user_credential_received = true;
 
-            Serial.printf("User credential received for: %s\r\n", g_str_received_username.c_str());
+            Serial1.printf("User credential received for: %s\r\n", g_str_received_username.c_str());
         }
     }
 };
@@ -296,7 +309,7 @@ void wifi_event_handler(WiFiEvent_t event, WiFiEventInfo_t info)
 {
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
     {
-        Serial.printf("WiFi disconnected, reason: %u (%s)\r\n",
+        Serial1.printf("WiFi disconnected, reason: %u (%s)\r\n",
                       info.wifi_sta_disconnected.reason,
                       wifi_disconnect_reason_str(info.wifi_sta_disconnected.reason));
     }
@@ -323,11 +336,11 @@ bool wifi_check_dns_healthy(void)
 
     if (b_lookup_ok && ip_resolved != IPAddress(0, 0, 0, 0))
     {
-        Serial.printf("%s resolves to %s\r\n", SERVER_HOST, ip_resolved.toString().c_str());
+        Serial1.printf("%s resolves to %s\r\n", SERVER_HOST, ip_resolved.toString().c_str());
         return true;
     }
 
-    Serial.printf("%s DNS check failed (resolved to %s)\r\n", SERVER_HOST, ip_resolved.toString().c_str());
+    Serial1.printf("%s DNS check failed (resolved to %s)\r\n", SERVER_HOST, ip_resolved.toString().c_str());
     return false;
 }
 
@@ -369,7 +382,7 @@ bool wifi_find_strongest_bssid(const String &str_ssid, uint8_t *p_bssid_out, int
     b_found = false;
     i32_best_rssi = -1000;
 
-    Serial.printf("Scanning for strongest '%s' AP...\r\n", str_ssid.c_str());
+    Serial1.printf("Scanning for strongest '%s' AP...\r\n", str_ssid.c_str());
 
     i32_network_count = WiFi.scanNetworks();
 
@@ -377,7 +390,7 @@ bool wifi_find_strongest_bssid(const String &str_ssid, uint8_t *p_bssid_out, int
     {
         if (WiFi.SSID(i32_i) == str_ssid)
         {
-            Serial.printf("  Candidate BSSID: %s, channel %ld, RSSI %ld\r\n",
+            Serial1.printf("  Candidate BSSID: %s, channel %ld, RSSI %ld\r\n",
                           WiFi.BSSIDstr(i32_i).c_str(), (long)WiFi.channel(i32_i), (long)WiFi.RSSI(i32_i));
 
             if (WiFi.RSSI(i32_i) > i32_best_rssi)
@@ -396,11 +409,11 @@ bool wifi_find_strongest_bssid(const String &str_ssid, uint8_t *p_bssid_out, int
 
     if (b_found)
     {
-        Serial.printf("Strongest '%s' AP: RSSI %ld\r\n", str_ssid.c_str(), (long)i32_best_rssi);
+        Serial1.printf("Strongest '%s' AP: RSSI %ld\r\n", str_ssid.c_str(), (long)i32_best_rssi);
     }
     else
     {
-        Serial.printf("'%s' not seen in scan - falling back to unpinned connect\r\n", str_ssid.c_str());
+        Serial1.printf("'%s' not seen in scan - falling back to unpinned connect\r\n", str_ssid.c_str());
     }
 
     return b_found;
@@ -435,7 +448,7 @@ bool wifi_connect_stored(void)
     /* If no valid credentials, return immediately */
     if (b_valid == false)
     {
-        Serial.printf("No stored WiFi credentials\r\n");
+        Serial1.printf("No stored WiFi credentials\r\n");
         g_preferences.end();
         return false;
     }
@@ -464,7 +477,7 @@ bool wifi_connect_stored(void)
     /* before giving up, since a single failed attempt is often transient */
     for (i32_attempt = 1; i32_attempt <= WIFI_CONNECT_RETRY_COUNT; i32_attempt++)
     {
-        Serial.printf("Connecting to stored WiFi: %s (attempt %ld/%d)\r\n",
+        Serial1.printf("Connecting to stored WiFi: %s (attempt %ld/%d)\r\n",
                       str_ssid.c_str(), i32_attempt, WIFI_CONNECT_RETRY_COUNT);
 
         /* Pin to the strongest known BSSID/channel if the scan found one - */
@@ -525,7 +538,7 @@ bool wifi_connect_stored(void)
             /* refused" upload could be landing on one with a bad internet */
             /* uplink even though the local WiFi link itself is fine. Log it */
             /* so a recurring failure can be correlated to one BSSID */
-            Serial.printf("WiFi connected, IP: %s, BSSID: %s, RSSI: %ld\r\n",
+            Serial1.printf("WiFi connected, IP: %s, BSSID: %s, RSSI: %ld\r\n",
                           WiFi.localIP().toString().c_str(), WiFi.BSSIDstr().c_str(), (long)WiFi.RSSI());
 
             if (wifi_check_dns_healthy())
@@ -533,11 +546,11 @@ bool wifi_connect_stored(void)
                 return true;
             }
 
-            Serial.printf("WiFi connected but DNS check failed - treating as a failed attempt\r\n");
+            Serial1.printf("WiFi connected but DNS check failed - treating as a failed attempt\r\n");
         }
         else
         {
-            Serial.printf("WiFi connection attempt %ld failed\r\n", i32_attempt);
+            Serial1.printf("WiFi connection attempt %ld failed\r\n", i32_attempt);
         }
 
         /* Reset the radio before the next attempt - see wifi_reset_radio() */
@@ -550,8 +563,28 @@ bool wifi_connect_stored(void)
         }
     }
 
-    Serial.printf("WiFi connection failed for data upload after %d attempts\r\n", WIFI_CONNECT_RETRY_COUNT);
+    Serial1.printf("WiFi connection failed for data upload after %d attempts\r\n", WIFI_CONNECT_RETRY_COUNT);
     return false;
+}
+
+/* Build the raw 9-byte device identifier: WiFi station MAC (6 bytes) */
+/* followed by the last 3 bytes of the Bluetooth MAC, into ui8_bytes_out, */
+/* which must be at least DEVICE_MAC_LEN bytes long. Shared by */
+/* get_device_mac_hex() below (ASCII hex, used in server URLs) and */
+/* print_device_id_over_usb() (raw bytes, used on the native USB port) so */
+/* the MAC-reading logic exists in exactly one place */
+void get_device_mac_bytes(uint8_t *ui8_bytes_out)
+{
+    uint8_t ui8_mac_bt[6];
+
+    /* WiFi station MAC is the chip's base MAC address */
+    WiFi.macAddress(ui8_bytes_out);
+    /* Bluetooth MAC is derived from the base MAC with a small offset */
+    esp_read_mac(ui8_mac_bt, ESP_MAC_BT);
+
+    memcpy(ui8_bytes_out + DEVICE_MAC_WIFI_LEN,
+           ui8_mac_bt + (sizeof(ui8_mac_bt) - DEVICE_MAC_BT_LEN),
+           DEVICE_MAC_BT_LEN);
 }
 
 /* Build the device identifier: WiFi station MAC (6 bytes) followed by the */
@@ -561,20 +594,10 @@ bool wifi_connect_stored(void)
 void get_device_mac_hex(char *str_hex_out)
 {
     static const char c_hex_digits[] = "0123456789ABCDEF";
-    uint8_t ui8_mac_wifi[DEVICE_MAC_WIFI_LEN];
-    uint8_t ui8_mac_bt[6];
     uint8_t ui8_mac_combined[DEVICE_MAC_LEN];
     int32_t i32_idx;
 
-    /* WiFi station MAC is the chip's base MAC address */
-    WiFi.macAddress(ui8_mac_wifi);
-    /* Bluetooth MAC is derived from the base MAC with a small offset */
-    esp_read_mac(ui8_mac_bt, ESP_MAC_BT);
-
-    memcpy(ui8_mac_combined, ui8_mac_wifi, DEVICE_MAC_WIFI_LEN);
-    memcpy(ui8_mac_combined + DEVICE_MAC_WIFI_LEN,
-           ui8_mac_bt + (sizeof(ui8_mac_bt) - DEVICE_MAC_BT_LEN),
-           DEVICE_MAC_BT_LEN);
+    get_device_mac_bytes(ui8_mac_combined);
 
     for (i32_idx = 0; i32_idx < DEVICE_MAC_LEN; i32_idx++)
     {
@@ -582,6 +605,64 @@ void get_device_mac_hex(char *str_hex_out)
         str_hex_out[i32_idx * 2 + 1] = c_hex_digits[ui8_mac_combined[i32_idx] & 0x0F];
     }
     str_hex_out[DEVICE_MAC_HEX_LEN] = '\0';
+}
+
+/* Print the device id over the chip's native USB CDC port at boot, as the */
+/* printable ASCII line "0xc0bec0b0b0<18 lowercase hex chars>\r\n" - the */
+/* 5-byte magic marker (g_ui8_usb_id_magic) followed by the 9 raw */
+/* device-id bytes (get_device_mac_bytes()), each hex-encoded so it shows */
+/* up as text in a normal serial terminal (raw binary bytes in that value */
+/* range render as invisible/garbled in most terminal emulators - they */
+/* look like malformed UTF-8). Always writes after a fixed settle delay - */
+/* deliberately NOT gated on Serial's connected/DTR flag, since that */
+/* only reflects whether the terminal app on the other end chose to assert */
+/* DTR on open, which not every terminal does, and was silently eating the */
+/* print even with a terminal genuinely attached and reading */
+void print_device_id_over_usb(void)
+{
+    uint8_t ui8_mac_bytes[DEVICE_MAC_LEN];
+    char str_line[2 + (sizeof(g_ui8_usb_id_magic) * 2) + (DEVICE_MAC_LEN * 2) + 3];
+    int32_t i32_pos;
+    int32_t i32_idx;
+
+    /* get_device_mac_bytes() reads the WiFi half via WiFi.macAddress(), */
+    /* which only returns the real efuse-programmed station MAC once the */
+    /* WiFi driver has been started - called this early in setup(), before */
+    /* any other WiFi.mode() call exists yet, it was observed returning a */
+    /* bogus address (06:00:00:00:00:00-shaped, not a real Espressif OUI) */
+    /* instead of the MAC every other code path (claim/upload URLs) ends up */
+    /* using once WiFi is actually brought up later. Starting the driver */
+    /* here - without changing get_device_mac_bytes() itself, which normal */
+    /* operation also relies on - makes this print match what the device */
+    /* actually sends over the network */
+    WiFi.mode(WIFI_STA);
+
+    Serial.begin(115200);
+    /* Let the USB peripheral settle after begin() before writing - not */
+    /* gated on Serial's connected/DTR state, since that reflects whether */
+    /* the terminal app on the other end chose to assert DTR on open, */
+    /* which not all of them do */
+    delay(USB_CONNECT_WAIT_MS);
+
+    get_device_mac_bytes(ui8_mac_bytes);
+
+    i32_pos = 0;
+    str_line[i32_pos++] = '0';
+    str_line[i32_pos++] = 'x';
+    for (i32_idx = 0; i32_idx < (int32_t)sizeof(g_ui8_usb_id_magic); i32_idx++)
+    {
+        i32_pos += sprintf(&str_line[i32_pos], "%02x", g_ui8_usb_id_magic[i32_idx]);
+    }
+    for (i32_idx = 0; i32_idx < DEVICE_MAC_LEN; i32_idx++)
+    {
+        i32_pos += sprintf(&str_line[i32_pos], "%02x", ui8_mac_bytes[i32_idx]);
+    }
+    str_line[i32_pos++] = '\r';
+    str_line[i32_pos++] = '\n';
+    str_line[i32_pos] = '\0';
+
+    Serial.print(str_line);
+    Serial.flush();
 }
 
 /* Percent-encodes str_in per RFC 3986 (unreserved = A-Za-z0-9-._~), so */
@@ -648,7 +729,7 @@ void claim_device(void)
         WiFiClientSecure wifi_client;
         HTTPClient http_client;
 
-        Serial.printf("Claiming device (attempt %ld/%d): %s\r\n",
+        Serial1.printf("Claiming device (attempt %ld/%d): %s\r\n",
                       i32_attempt, DATA_UPLOAD_RETRY_COUNT, str_url.c_str());
 
         /* Skip certificate verification for now */
@@ -676,8 +757,8 @@ void claim_device(void)
                 /* User-Agent fix in send_to_server()), which would otherwise */
                 /* look identical to a real claim success here */
                 String str_response_body = http_client.getString();
-                Serial.printf("Claim device response: %ld\r\n", i32_response_code);
-                Serial.printf("Claim response body: %s\r\n", str_response_body.c_str());
+                Serial1.printf("Claim device response: %ld\r\n", i32_response_code);
+                Serial1.printf("Claim response body: %s\r\n", str_response_body.c_str());
                 http_client.end();
 
                 if (str_response_body == "OK")
@@ -691,7 +772,7 @@ void claim_device(void)
                     return;
                 }
 
-                Serial.printf("Claim device: 200 but unexpected body - treating as failure\r\n");
+                Serial1.printf("Claim device: 200 but unexpected body - treating as failure\r\n");
                 send_status("CLAIM_FAILED");
                 g_b_user_credential_received = false;
                 return;
@@ -701,21 +782,21 @@ void claim_device(void)
                 /* server responded but rejected the claim (e.g. hash didn't */
                 /* match) - retrying won't change that outcome, so tell the */
                 /* phone now instead of burning the remaining attempts */
-                Serial.printf("Claim device rejected: %ld\r\n", i32_response_code);
-                Serial.printf("Claim response body: %s\r\n", http_client.getString().c_str());
+                Serial1.printf("Claim device rejected: %ld\r\n", i32_response_code);
+                Serial1.printf("Claim response body: %s\r\n", http_client.getString().c_str());
                 http_client.end();
                 send_status("CLAIM_FAILED");
                 g_b_user_credential_received = false;
                 return;
             }
 
-            Serial.printf("Claim device HTTPS GET failed, error: %s (free heap: %u)\r\n",
+            Serial1.printf("Claim device HTTPS GET failed, error: %s (free heap: %u)\r\n",
                           http_client.errorToString(i32_response_code).c_str(), ESP.getFreeHeap());
             http_client.end();
         }
         else
         {
-            Serial.printf("Claim device: failed to begin HTTPS connection (free heap: %u)\r\n", ESP.getFreeHeap());
+            Serial1.printf("Claim device: failed to begin HTTPS connection (free heap: %u)\r\n", ESP.getFreeHeap());
         }
 
         /* Same backoff+jitter reasoning as send_to_server() */
@@ -728,7 +809,7 @@ void claim_device(void)
     /* Every attempt failed at the connection level (never got a response */
     /* at all) - let the phone know instead of leaving it thinking CONNECT_OK */
     /* (WiFi joined fine) meant the whole setup succeeded */
-    Serial.printf("Claim device failed after %d attempts\r\n", DATA_UPLOAD_RETRY_COUNT);
+    Serial1.printf("Claim device failed after %d attempts\r\n", DATA_UPLOAD_RETRY_COUNT);
     send_status("CLAIM_FAILED");
     g_b_user_credential_received = false;
 }
@@ -772,7 +853,7 @@ void send_to_server(int32_t i32_temperature, int32_t i32_pressure, int32_t i32_h
         WiFiClientSecure wifi_client;
         HTTPClient http_client;
 
-        Serial.printf("Sending data (attempt %ld/%d): %s\r\n",
+        Serial1.printf("Sending data (attempt %ld/%d): %s\r\n",
                       i32_attempt, DATA_UPLOAD_RETRY_COUNT, str_url.c_str());
 
         /* Skip certificate verification for now */
@@ -805,8 +886,8 @@ void send_to_server(int32_t i32_temperature, int32_t i32_pressure, int32_t i32_h
                 /* Log the status code AND the response body - a 200 status */
                 /* does not by itself prove update_alx.php actually ran; a */
                 /* WAF/bot-protection block page can also return 200 */
-                Serial.printf("Server response: %ld\r\n", i32_response_code);
-                Serial.printf("Response body: %s\r\n", http_client.getString().c_str());
+                Serial1.printf("Server response: %ld\r\n", i32_response_code);
+                Serial1.printf("Response body: %s\r\n", http_client.getString().c_str());
                 /* Close the connection and stop retrying - request succeeded */
                 http_client.end();
                 return;
@@ -815,14 +896,14 @@ void send_to_server(int32_t i32_temperature, int32_t i32_pressure, int32_t i32_h
             /* Free heap alongside the error - a "connection refused" that */
             /* only shows up when heap is low points at local TLS/socket */
             /* resource exhaustion rather than the host rejecting us */
-            Serial.printf("HTTPS GET failed, error: %s (free heap: %u)\r\n",
+            Serial1.printf("HTTPS GET failed, error: %s (free heap: %u)\r\n",
                           http_client.errorToString(i32_response_code).c_str(), ESP.getFreeHeap());
             /* Close the connection before the next attempt */
             http_client.end();
         }
         else
         {
-            Serial.printf("Unable to connect to server (free heap: %u)\r\n", ESP.getFreeHeap());
+            Serial1.printf("Unable to connect to server (free heap: %u)\r\n", ESP.getFreeHeap());
         }
 
         /* Back off before retrying, unless this was the last attempt. */
@@ -836,7 +917,7 @@ void send_to_server(int32_t i32_temperature, int32_t i32_pressure, int32_t i32_h
         }
     }
 
-    Serial.printf("Data upload failed after %d attempts\r\n", DATA_UPLOAD_RETRY_COUNT);
+    Serial1.printf("Data upload failed after %d attempts\r\n", DATA_UPLOAD_RETRY_COUNT);
 }
 
 /* Send a status notification string to the phone via the status characteristic */
@@ -849,7 +930,7 @@ void send_status(const char *p_message)
         gp_char_status->setValue(p_message);
         /* Send the notification to the phone */
         gp_char_status->notify();
-        Serial.printf("Status sent: %s\r\n", p_message);
+        Serial1.printf("Status sent: %s\r\n", p_message);
     }
 }
 
@@ -938,7 +1019,7 @@ void ble_setup(void)
     /* Set the global flag */
     g_b_ble_active = true;
 
-    Serial.printf("BLE GATT server started as '%s'\r\n", BLE_DEVICE_NAME);
+    Serial1.printf("BLE GATT server started as '%s'\r\n", BLE_DEVICE_NAME);
 }
 
 /* Scan for 2.4GHz WiFi networks and send the results to the phone via BLE */
@@ -953,7 +1034,7 @@ void wifi_scan_and_send(void)
 
     /* Notify the phone that scanning has started */
     send_status("SCANNING");
-    Serial.printf("Starting WiFi scan...\r\n");
+    Serial1.printf("Starting WiFi scan...\r\n");
 
     /* Set WiFi to station mode and disconnect from any previous connection */
     WiFi.mode(WIFI_STA);
@@ -964,7 +1045,7 @@ void wifi_scan_and_send(void)
     /* Perform a synchronous scan of all available networks */
     i32_network_count = WiFi.scanNetworks();
 
-    Serial.printf("Scan complete, found %ld networks\r\n", i32_network_count);
+    Serial1.printf("Scan complete, found %ld networks\r\n", i32_network_count);
 
     /* If no networks found, notify the phone and return */
     if (i32_network_count <= 0)
@@ -996,7 +1077,7 @@ void wifi_scan_and_send(void)
             /* Send the notification to the phone */
             gp_char_wifilist->notify();
 
-            Serial.printf("Sent network: %s\r\n", str_entry.c_str());
+            Serial1.printf("Sent network: %s\r\n", str_entry.c_str());
 
             /* Increment the sent counter */
             i32_sent++;
@@ -1066,7 +1147,7 @@ void wifi_connect_and_store(void)
     /* before giving up, since a single failed attempt is often transient */
     for (i32_attempt = 1; i32_attempt <= WIFI_CONNECT_RETRY_COUNT; i32_attempt++)
     {
-        Serial.printf("Connecting to '%s' (attempt %ld/%d)...\r\n",
+        Serial1.printf("Connecting to '%s' (attempt %ld/%d)...\r\n",
                       str_ssid.c_str(), i32_attempt, WIFI_CONNECT_RETRY_COUNT);
 
         /* Pin to the strongest known BSSID/channel if the scan found one - */
@@ -1116,7 +1197,7 @@ void wifi_connect_and_store(void)
             {
                 break;
             }
-            Serial.printf("WiFi connected but DNS check failed - treating as a failed attempt\r\n");
+            Serial1.printf("WiFi connected but DNS check failed - treating as a failed attempt\r\n");
         }
         /* WL_CONNECT_FAILED means the AP actively rejected the handshake */
         /* (wrong password) rather than just being unreachable - retrying */
@@ -1124,7 +1205,7 @@ void wifi_connect_and_store(void)
         /* so give up immediately instead of burning the remaining attempts */
         else if (WiFi.status() == WL_CONNECT_FAILED)
         {
-            Serial.printf("WiFi connection rejected (wrong password?) - not retrying\r\n");
+            Serial1.printf("WiFi connection rejected (wrong password?) - not retrying\r\n");
             /* Reset the radio, not just disconnect - see wifi_reset_radio(). */
             /* Without this, the driver is left in a bad state and every */
             /* future WiFi.begin() silently fails too, even a later, */
@@ -1134,7 +1215,7 @@ void wifi_connect_and_store(void)
         }
         else
         {
-            Serial.printf("WiFi connection attempt %ld failed\r\n", i32_attempt);
+            Serial1.printf("WiFi connection attempt %ld failed\r\n", i32_attempt);
         }
 
         /* Reset the radio before the next attempt - a plain disconnect() */
@@ -1156,7 +1237,7 @@ void wifi_connect_and_store(void)
     /* If still not connected after all retries, report failure */
     if (WiFi.status() != WL_CONNECTED)
     {
-        Serial.printf("WiFi connection failed after %d attempts\r\n", WIFI_CONNECT_RETRY_COUNT);
+        Serial1.printf("WiFi connection failed after %d attempts\r\n", WIFI_CONNECT_RETRY_COUNT);
         /* Notify the phone that connection failed */
         send_status("CONNECT_FAIL");
         /* Reset the radio - loop() may invoke this function again */
@@ -1167,7 +1248,7 @@ void wifi_connect_and_store(void)
     }
 
     /* See the BSSID note in wifi_connect_stored() */
-    Serial.printf("WiFi connected, IP: %s, BSSID: %s, RSSI: %ld\r\n",
+    Serial1.printf("WiFi connected, IP: %s, BSSID: %s, RSSI: %ld\r\n",
                   WiFi.localIP().toString().c_str(), WiFi.BSSIDstr().c_str(), (long)WiFi.RSSI());
 
     /* Open the flash storage namespace for writing */
@@ -1181,7 +1262,7 @@ void wifi_connect_and_store(void)
     /* Close the flash storage */
     g_preferences.end();
 
-    Serial.printf("Credentials stored to flash\r\n");
+    Serial1.printf("Credentials stored to flash\r\n");
 
     /* Notify the phone that connection was successful */
     send_status("CONNECT_OK");
@@ -1229,12 +1310,12 @@ void parse_measurement(String str_data)
         /* silently reading as +0.57C instead of -0.57C) since plain 0 has no */
         /* separate negative representation - print the sign explicitly instead */
         /* of relying on the integer part to carry it */
-        Serial.printf("Temperature: %s%ld.%02ld C\r\n",
+        Serial1.printf("Temperature: %s%ld.%02ld C\r\n",
                       (i32_temperature < 0) ? "-" : "",
                       abs(i32_temperature / TEMP_SCALE), abs(i32_temperature % TEMP_SCALE));
-        Serial.printf("Pressure:    %ld Pa\r\n", i32_pressure);
-        Serial.printf("Humidity:    %ld.%03ld %%\r\n", i32_humidity / HUM_SCALE, abs(i32_humidity % HUM_SCALE));
-        Serial.printf("Battery:     %ld mV\r\n", i32_battery);
+        Serial1.printf("Pressure:    %ld Pa\r\n", i32_pressure);
+        Serial1.printf("Humidity:    %ld.%03ld %%\r\n", i32_humidity / HUM_SCALE, abs(i32_humidity % HUM_SCALE));
+        Serial1.printf("Battery:     %ld mV\r\n", i32_battery);
 
         /* Connect to WiFi using stored credentials */
         if (wifi_connect_stored())
@@ -1243,21 +1324,35 @@ void parse_measurement(String str_data)
             send_to_server(i32_temperature, i32_pressure, i32_humidity, i32_battery);
             /* Disconnect WiFi after upload */
             WiFi.disconnect();
-            Serial.printf("WiFi disconnected after upload\r\n");
+            Serial1.printf("WiFi disconnected after upload\r\n");
         }
         else
         {
-            Serial.printf("Skipping data upload - no WiFi connection\r\n");
+            Serial1.printf("Skipping data upload - no WiFi connection\r\n");
         }
     }
     else
     {
-        Serial.printf("Parse error: only %ld of %d fields recognised\r\n", i32_parsed, PARSE_FIELD_COUNT);
+        Serial1.printf("Parse error: only %ld of %d fields recognised\r\n", i32_parsed, PARSE_FIELD_COUNT);
     }
 } 
 
 void setup()
 {
+    /* Builtin LED, just turn on to indicate that system is working */
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
+
+    /* Only the production/bench-test case needs the native USB device-id */
+    /* print (and its up-to-USB_CONNECT_WAIT_MS wait) - see */
+    /* USB_UART_SELECT_PIN above for the pulled-high-skips/grounded-enables */
+    /* logic. Normal boots (pin left floating) skip it entirely */
+    pinMode(USB_UART_SELECT_PIN, INPUT_PULLUP);
+    if (digitalRead(USB_UART_SELECT_PIN) == LOW)
+    {
+        print_device_id_over_usb();
+    }
+
     /* Initialise the BLE active flag */
     g_b_ble_active = false;
     /* Initialise all BLE communication flags */
@@ -1275,20 +1370,17 @@ void setup()
     pinMode(READY_PIN, OUTPUT);
     digitalWrite(READY_PIN, LOW);
 
-    /* Builtin LED, just turn on to indicate that system is working */
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, LOW);
-
-    /* Debug UART + STM32 link share this one physical port (see the */
-    /* #define Serial Serial1 above), so it has to run at the STM32's fixed */
-    /* UART_BAUD (9600) rather than a faster debug-only rate - an external */
-    /* USB-UART adapter reading TX_PIN just needs to be set to 9600 8N1 */
-    Serial.begin(UART_BAUD, SERIAL_8N1, RX_PIN, TX_PIN);
+    /* Debug UART + STM32 link share this one physical port (Serial1, used */
+    /* for all debug logging throughout this file), so it has to run at the */
+    /* STM32's fixed UART_BAUD (9600) rather than a faster debug-only rate - */
+    /* an external USB-UART adapter reading TX_PIN just needs to be set to */
+    /* 9600 8N1 */
+    Serial1.begin(UART_BAUD, SERIAL_8N1, RX_PIN, TX_PIN);
     /* Flush any bootloader garbage sitting in RX buffer */
     delay(DELAY_100MS);
-    while (Serial.available())
+    while (Serial1.available())
     {
-        Serial.read();
+        Serial1.read();
     }
 
     /* Log the specific reason for every WiFi disconnect (see */
@@ -1296,7 +1388,7 @@ void setup()
     /* apart from "wrong password" apart from "signal dropped mid-connect" */
     WiFi.onEvent(wifi_event_handler);
 
-    Serial.printf("Debug UART initialized\r\n");
+    Serial1.printf("Debug UART initialized\r\n");
 }
 
 void loop()
@@ -1307,7 +1399,7 @@ void loop()
     /* Heartbeat print every 5 seconds to confirm loop is running */
     if ((millis() - s_ui32_last_heartbeat) >= 5000u)
     {
-        Serial.printf("Loop running, BLE=%d, scan_req=%d, cred_req=%d\r\n",
+        Serial1.printf("Loop running, BLE=%d, scan_req=%d, cred_req=%d\r\n",
                       g_b_client_connected, g_b_scan_requested, g_b_credential_received);
         s_ui32_last_heartbeat = millis();
     }
@@ -1360,6 +1452,6 @@ void loop()
         /* password. READY_PIN only goes low once BLE actually disconnects */
         /* (see NimbusServerCallbacks::onDisconnect) */
         wifi_connect_and_store();
-        Serial.printf ("DONE, network connected and stored\r\n");
+        Serial1.printf ("DONE, network connected and stored\r\n");
     }
 }
