@@ -170,7 +170,7 @@ static bool RunEsptoolWriteFlash(int comPort)
     std::vector<char> cmdLineBuf(cmdLine.begin(), cmdLine.end());
     cmdLineBuf.push_back('\0');
 
-    std::cout << "--- Flashing firmware ---\n" << cmdLine << "\n";
+    std::cout << "--- Flashing firmware ---\n\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n!!!!!!!!MAKE SUERE THAT D0 is connected to GND!!!!!!!!\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n" << cmdLine << "\n";
 
     STARTUPINFOA startupInfo = { sizeof(startupInfo) };
     PROCESS_INFORMATION processInfo = { 0 };
