@@ -1,0 +1,12 @@
+alx_description_of_context.txt  * this file
+captcha.php                     * captcha generator
+claim_device.php                * This file is used when user claims a registered device
+claim_device_alx.php            * This file is used when I (alex) add newly built device
+config.php                      * This is the config file
+confirm.php                     * Confirmation
+delete_device.php               * Delete devcie
+icon.png                        * Inon
+index.php                       * Main landing page
+install_alx.php                 * Install db
+mailer.php                      * Mailer script
+reset_password.php              * Reset password

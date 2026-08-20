@@ -13,7 +13,14 @@
  * "0xc0bec0b0b00600040000005a8035"), then hit this URL with it as the "id"
  * query param. That registers the device with user_id = 0 (unclaimed) -
  * BLE setup against claim_device.php can then claim it for a dashboard
- * account. */
+ * account.
+ *
+ * Idempotent by design: if a row for this device_number already exists
+ * (e.g. the same physical board gets erased/re-flashed and re-registered
+ * during dev/rework via cpp_production), that old row - whatever user_id
+ * or last_reading it had - is deleted and replaced with a completely
+ * fresh unclaimed row, rather than failing with "already exists". A
+ * re-flashed board is meant to start clean. */
 
 require_once __DIR__ . '/config.php';
 
@@ -45,7 +52,6 @@ $mac_hex = $matches[1];
 
 $mac_binary = hex2bin($mac_hex);
 
-$already_exists = false;
 $db_error = false;
 try
 {
@@ -53,19 +59,23 @@ try
     /* created_at is a TIMESTAMP column - see the same note in claim_device.php */
     $mysqli->query("SET time_zone = '+00:00'");
 
-    /* device_number is UNIQUE, so INSERT IGNORE atomically does nothing if */
-    /* a row for this device already exists - affected_rows then */
-    /* distinguishes "just inserted" (1) from "already there" (0) with no */
-    /* separate SELECT and no race condition between the check and the */
-    /* insert. Explicit PHP-generated UTC value instead of NOW() - see the */
-    /* same note in claim_device.php */
+    /* device_number is UNIQUE - delete any existing row for it first (a */
+    /* re-flashed/re-registered board should start completely clean, not */
+    /* keep a previous claim/last_reading around or fail because a row */
+    /* already exists), then insert a fresh unclaimed one. Explicit */
+    /* PHP-generated UTC value instead of NOW() - see the same note in */
+    /* claim_device.php */
+    $delete = $mysqli->prepare('DELETE FROM devices WHERE device_number = ?');
+    $delete->bind_param('s', $mac_binary);
+    $delete->execute();
+    $delete->close();
+
     $created_at_utc = gmdate('Y-m-d H:i:s');
     $insert = $mysqli->prepare(
-        'INSERT IGNORE INTO devices (user_id, device_number, created_at) VALUES (0, ?, ?)'
+        'INSERT INTO devices (user_id, device_number, created_at) VALUES (0, ?, ?)'
     );
     $insert->bind_param('ss', $mac_binary, $created_at_utc);
     $insert->execute();
-    $already_exists = ($insert->affected_rows === 0);
     $insert->close();
 
     $mysqli->close();
@@ -80,13 +90,6 @@ if ($db_error)
 {
     http_response_code(500);
     echo "ERROR: Could not register device";
-    exit;
-}
-
-if ($already_exists)
-{
-    http_response_code(409);
-    echo "ERROR: Device already exists";
     exit;
 }
 
