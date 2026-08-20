@@ -63,6 +63,12 @@ static std::vector<int> EnumerateAvailableComPorts()
     return ports;
 }
 
+static bool FileExists(const std::string& path)
+{
+    DWORD attrs = GetFileAttributesA(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
 // Proper wide->narrow conversion (avoids silently truncating each wchar_t to a char).
 static std::string NarrowFromWide(const std::wstring& wide)
 {
@@ -136,6 +142,60 @@ static std::map<int, std::string> QueryComPortFriendlyNames()
     return names;
 }
 
+// Flashes complete_fw.bin via esptool.exe. Both are expected in the current working
+// directory - this tool is always launched from its own folder, so no path resolution
+// is needed. Chip type is left for esptool to auto-detect rather than hardcoded, so
+// this doesn't need updating if a different ESP32 variant is used later. esptool's own
+// console output streams straight through (child inherits this process's console, same
+// as running it by hand) rather than being captured, for the same "show everything"
+// visibility as HttpsGetClaimResult's request/response dump.
+static bool RunEsptoolWriteFlash(int comPort)
+{
+    if (!FileExists("esptool.exe"))
+    {
+        std::cerr << "esptool.exe not found in the current directory\n";
+        return false;
+    }
+    if (!FileExists("complete_fw.bin"))
+    {
+        std::cerr << "complete_fw.bin not found in the current directory\n";
+        return false;
+    }
+
+    std::string cmdLine = "esptool.exe --port COM" + std::to_string(comPort) +
+        " --baud 921600 write_flash 0x0 complete_fw.bin";
+
+    // CreateProcessA may write into this buffer, so a std::string's own storage
+    // (or a string literal) isn't safe to pass directly as lpCommandLine.
+    std::vector<char> cmdLineBuf(cmdLine.begin(), cmdLine.end());
+    cmdLineBuf.push_back('\0');
+
+    std::cout << "--- Flashing firmware ---\n" << cmdLine << "\n";
+
+    STARTUPINFOA startupInfo = { sizeof(startupInfo) };
+    PROCESS_INFORMATION processInfo = { 0 };
+
+    BOOL created = CreateProcessA(NULL, cmdLineBuf.data(), NULL, NULL, FALSE, 0, NULL, NULL,
+        &startupInfo, &processInfo);
+    if (!created)
+    {
+        std::cerr << "Failed to launch esptool.exe (error " << GetLastError() << ")\n";
+        return false;
+    }
+
+    WaitForSingleObject(processInfo.hProcess, INFINITE);
+
+    DWORD exitCode = 1;
+    GetExitCodeProcess(processInfo.hProcess, &exitCode);
+
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+
+    std::cout << "--- esptool exited with code " << exitCode << " ---\n";
+
+    return exitCode == 0;
+}
+
 static HANDLE OpenComPort(int portNumber)
 {
     // "\\.\COMx" works for both single- and double-digit port numbers.
@@ -170,6 +230,33 @@ static HANDLE OpenComPort(int portNumber)
     SetCommTimeouts(hSerial, &timeouts);
 
     return hSerial;
+}
+
+// Retries OpenComPort() for up to totalTimeoutMs. Needed right after
+// RunEsptoolWriteFlash(): the XIAO ESP32-S3's native USB means the post-flash reset can
+// make the port briefly disappear and re-enumerate rather than just staying put, so the
+// very next open attempt can spuriously fail if it lands in that gap.
+static HANDLE OpenComPortWithRetry(int portNumber, DWORD totalTimeoutMs)
+{
+    const DWORD retryIntervalMs = 500;
+    DWORD elapsedMs = 0;
+
+    for (;;)
+    {
+        HANDLE hSerial = OpenComPort(portNumber);
+        if (hSerial != INVALID_HANDLE_VALUE)
+        {
+            return hSerial;
+        }
+
+        if (elapsedMs >= totalTimeoutMs)
+        {
+            return INVALID_HANDLE_VALUE;
+        }
+
+        Sleep(retryIntervalMs);
+        elapsedMs += retryIntervalMs;
+    }
 }
 
 // Blocks until a full line (terminated by '\n') arrives; strips a trailing '\r'.
@@ -399,7 +486,14 @@ int main(int argc, char* argv[])
         }
     }
 
-    HANDLE hSerial = OpenComPort(comPort);
+    if (!RunEsptoolWriteFlash(comPort))
+    {
+        std::cerr << "Firmware flash failed - aborting\n";
+        return 1;
+    }
+
+    std::cout << "Reopening COM" << comPort << " after flash (device may take a moment to re-enumerate)...\n";
+    HANDLE hSerial = OpenComPortWithRetry(comPort, 10000);
     if (hSerial == INVALID_HANDLE_VALUE)
     {
         std::cerr << "Failed to open COM" << comPort << "\n";
