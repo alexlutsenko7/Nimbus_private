@@ -343,11 +343,14 @@ void WiFiSetup(void)
 
 	printf ("[9]Woken up for setup\r\n");
 	HAL_GPIO_WritePin(GPIOB, Power_WiFi_BT_Pin, GPIO_PIN_SET);
+	watchdog_reset();
+	HAL_Delay(INIT_DELAY);
+	watchdog_reset();
 	/* Empty string */
 	sprintf ((char*)ui8pBuf, "%c", '\0');
     /* watchdog reset */
  	watchdog_reset();
-	/* Confirm that part is awoke */
+	/* Confirm that part is awake */
  	ConfirmComm(GPIO_PIN_RESET, ESP_GENTIMEOUT, ui8pBuf);
 	/* Request setup */
  	sprintf ((char*)ui8pBuf, "Setup requested\r\n");
@@ -539,12 +542,13 @@ void ConfirmComm(bool bState, uint32_t ui32CommDelay, uint8_t *ui8Data)
 	{
 		/* Reset watchdog during wait */
 		watchdog_reset();
-		/* Transmit the weather data in loop until ESP32 gets it */
+		/* Transmit the data in loop until ESP32 gets it */
 		printf ("%s", ui8Data);
 		/* Set the flag if ESP32 is ok _OR_ if button is pressed during the process */
 		if (HAL_GPIO_ReadPin(GPIOA, ESP_FEEDBACK_Pin) == bState || (HAL_GetTick() > HAL_BUTTON_TIMEOUT && HAL_GPIO_ReadPin(GPIOA, SetupButton_Pin)))
 		{
 			bClean = true;
+			printf ("[13] Exit because: ESP_FEEDBACK_Pin=%d == bState=%d _OR_ (Tick=%d which should be more than %d _AND_ pin is %d\r\n", (int)HAL_GPIO_ReadPin(GPIOA, ESP_FEEDBACK_Pin), (int)bState, (int)HAL_GetTick(), (int)HAL_BUTTON_TIMEOUT, (int)HAL_GPIO_ReadPin(GPIOA, SetupButton_Pin));
 		}
 	}
 
@@ -584,8 +588,7 @@ void GetMeasurmentThenUpdate(void)
 	HAL_GPIO_WritePin(GPIOB, Power_WiFi_BT_Pin, GPIO_PIN_SET);
 	/* Reset watchdog */
 	watchdog_reset();
-	HAL_Delay(INIT_DELAY);watchdog_reset();
-
+	HAL_Delay(INIT_DELAY);
 	watchdog_reset();
 	/* Confirm that ESP32 is started **/
 	sprintf ((char*)ui8pBuf, "%c", '\0');

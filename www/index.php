@@ -653,37 +653,38 @@ if ($current_user === null)
 /* Authenticated - render the dashboard as before                        */
 /* --------------------------------------------------------------------- */
 
-/* the (single) device belonging to the current user, along with its last */
-/* reported reading (devices.last_reading, updated by update_alx.php) - */
-/* no data.json file is used any more */
-$device = null;
-$has_reading = false;
-$temp_val = '--';
-$press_val = '--';
-$hum_val = '--';
-$batt_val = '--';
-$wifi_val = '';
-$timestamp = 'No data received yet';
-$source_ip = '';
-$batt_class = '';
+/* every device belonging to the current user (accounts can own more than */
+/* one), along with each one's last reported reading (devices.last_reading, */
+/* updated by update_alx.php) - no data.json file is used any more. Oldest */
+/* first, so the first-ever claimed device renders as the "main" one */
+$devices = array();
 
 if ($mysqli !== null)
 {
     try
     {
-        $stmt = $mysqli->prepare('SELECT device_number, last_reading, created_at FROM devices WHERE user_id = ? LIMIT 1');
+        $stmt = $mysqli->prepare('SELECT device_number, last_reading, created_at FROM devices WHERE user_id = ? ORDER BY created_at ASC');
         $stmt->bind_param('i', $current_user_id);
         $stmt->execute();
         $stmt->store_result();
         $stmt->bind_result($db_device_number, $db_last_reading, $db_created_at);
 
-        if ($stmt->fetch())
+        while ($stmt->fetch())
         {
             $created_utc = new DateTime($db_created_at, new DateTimeZone('UTC'));
             $created_utc->setTimezone(new DateTimeZone('America/Toronto'));
-            $device = array(
+            $entry = array(
                 'device_number' => strtoupper(bin2hex($db_device_number)),
-                'created_at'    => $created_utc->format('Y-m-d H:i:s')
+                'created_at'    => $created_utc->format('Y-m-d H:i:s'),
+                'has_reading'   => false,
+                'temp_val'      => '--',
+                'press_val'     => '--',
+                'hum_val'       => '--',
+                'batt_val'      => '--',
+                'wifi_val'      => '',
+                'timestamp'     => 'No data received yet',
+                'source_ip'     => '',
+                'batt_class'    => ''
             );
 
             if ($db_last_reading !== null)
@@ -695,31 +696,33 @@ if ($mysqli !== null)
                 /* for missing keys and rendering a half-populated dashboard */
                 if ($d !== null && isset($d['temperature'], $d['pressure'], $d['humidity'], $d['battery'], $d['timestamp']))
                 {
-                    $has_reading = true;
+                    $entry['has_reading'] = true;
                     /* temperature: stored as integer * 100, display as XX.XX */
-                    $temp_val = number_format($d['temperature'] / 100, 2);
+                    $entry['temp_val'] = number_format($d['temperature'] / 100, 2);
                     /* pressure: stored in Pa, display as hPa */
-                    $press_val = number_format($d['pressure'] / 100, 2);
+                    $entry['press_val'] = number_format($d['pressure'] / 100, 2);
                     /* humidity: stored as integer * 1000, display as XX.XX */
-                    $hum_val = number_format($d['humidity'] / 1000, 2);
+                    $entry['hum_val'] = number_format($d['humidity'] / 1000, 2);
                     /* battery: stored in mV */
-                    $batt_val = $d['battery'];
+                    $entry['batt_val'] = $d['battery'];
                     /* wifi_signal: dBm, missing on readings from before this */
-                    /* field existed - leave $wifi_val blank rather than 0 so */
+                    /* field existed - leave wifi_val blank rather than 0 so */
                     /* an old reading doesn't render a fake "0dBm" */
-                    $wifi_val = isset($d['wifi_signal']) ? $d['wifi_signal'] . 'dBm' : '';
+                    $entry['wifi_val'] = isset($d['wifi_signal']) ? $d['wifi_signal'] . 'dBm' : '';
 
                     /* timestamp from the server - convert to Toronto local time */
                     $utc_time = new DateTime($d['timestamp'], new DateTimeZone('UTC'));
                     $utc_time->setTimezone(new DateTimeZone('America/Toronto'));
-                    $timestamp = 'Last reading: ' . $utc_time->format('Y-m-d H:i:s');
+                    $entry['timestamp'] = 'Last reading: ' . $utc_time->format('Y-m-d H:i:s');
 
                     /* source ip */
-                    $source_ip = isset($d['ip']) ? 'From: ' . $d['ip'] : '';
+                    $entry['source_ip'] = isset($d['ip']) ? 'From: ' . $d['ip'] : '';
                     /* battery warning below 2500mV */
-                    $batt_class = ($d['battery'] < 2500) ? ' low' : '';
+                    $entry['batt_class'] = ($d['battery'] < 2500) ? ' low' : '';
                 }
             }
+
+            $devices[] = $entry;
         }
         $stmt->close();
     }
@@ -880,11 +883,22 @@ if ($mysqli !== null)
     .devices {
         width: 100%;
         max-width: 760px;
-        margin-top: 1rem;
+        margin-bottom: 1rem;
         background: var(--panel);
         border: 1px solid var(--panel-edge);
         border-radius: 10px;
         padding: 1rem 1.4rem;
+    }
+
+    /* separates one sensor's section from the next when an account has */
+    /* more than one device - never shown before the first or trailing */
+    /* after the last, only between consecutive sensors */
+    .device-sep {
+        width: 100%;
+        max-width: 760px;
+        border: none;
+        border-top: 1px solid var(--panel-edge);
+        margin: 1.6rem 0;
     }
 
     .devices-title {
@@ -915,12 +929,58 @@ if ($mysqli !== null)
         color: var(--ink-dim);
     }
 
+    .device-delete {
+        background: none;
+        border: none;
+        color: var(--ink-dim);
+        font-size: 0.9rem;
+        line-height: 1;
+        cursor: pointer;
+        padding: 0.15rem 0.3rem;
+        margin-left: 0.6rem;
+        border-radius: 4px;
+    }
+
+    .device-delete:hover {
+        color: var(--warn);
+    }
+
+    .device-confirm {
+        display: none;
+        align-items: center;
+        gap: 0.6rem;
+        flex-wrap: wrap;
+        font-size: 0.78rem;
+        color: var(--ink-dim);
+        border-top: 1px solid var(--grid);
+        padding-top: 0.6rem;
+        margin-top: 0.2rem;
+    }
+
+    .device-confirm.open {
+        display: flex;
+    }
+
+    .device-confirm button {
+        font-family: var(--mono);
+        font-size: 0.74rem;
+        border-radius: 5px;
+        padding: 0.25rem 0.55rem;
+        cursor: pointer;
+        border: 1px solid var(--panel-edge);
+        background: var(--bg);
+        color: var(--ink);
+    }
+
+    .device-confirm button.confirm-yes {
+        border-color: var(--warn);
+        color: var(--warn);
+    }
+
     .footer {
-        width: 100%;
-        max-width: 760px;
-        margin-top: 1.6rem;
-        padding-top: 0.9rem;
-        border-top: 1px solid var(--panel-edge);
+        margin-top: 0.8rem;
+        padding-top: 0.6rem;
+        border-top: 1px solid var(--grid);
         display: flex;
         justify-content: space-between;
         font-family: var(--mono);
@@ -940,7 +1000,17 @@ if ($mysqli !== null)
         color: var(--ink-dim);
     }
 
+    /* extra blank scroll room below the last sensor, only needed on a */
+    /* narrow/mobile viewport where the Android app's floating "Add sensor" */
+    /* button can otherwise sit on top of the bottom of the page content */
+    .mobile-scroll-spacer {
+        display: none;
+    }
+
     @media (max-width: 520px) {
+        .mobile-scroll-spacer {
+            display: block;
+        }
         .grid {
             grid-template-columns: 1fr;
             gap: 0.6rem;
@@ -996,54 +1066,119 @@ if ($mysqli !== null)
     <div class="banner-ok">Password changed.</div>
     <?php endif; ?>
 
-    <?php if ($device === null): ?>
+    <?php if (empty($devices)): ?>
         <div class="empty-state">No sensors added</div>
-    <?php elseif (!$has_reading): ?>
-        <div class="empty-state">Device has been added, now waiting for data - this may take ~15 minutes.</div>
-
-        <div class="devices">
-            <div class="devices-title">Device</div>
-            <div class="device-row">
-                <span class="device-number"><?php echo htmlspecialchars($device['device_number']); ?></span>
-                <span class="device-created">Added <?php echo htmlspecialchars($device['created_at']); ?></span>
-            </div>
-        </div>
     <?php else: ?>
-        <div class="grid">
-            <div class="reading">
-                <div class="label">Temperature</div>
-                <div class="value"><?php echo $temp_val; ?><span class="unit">&deg;C</span></div>
+        <?php foreach ($devices as $i => $dev): ?>
+            <?php if ($i > 0): ?>
+                <hr class="device-sep">
+            <?php endif; ?>
+
+            <div class="devices" data-device-number="<?php echo htmlspecialchars($dev['device_number']); ?>">
+                <div class="devices-title">Device</div>
+                <div class="device-row">
+                    <span class="device-number"><?php echo htmlspecialchars($dev['device_number']); ?></span>
+                    <button type="button" class="device-delete" title="Delete sensor" onclick="deviceDeleteShowConfirm(this)">&#128465;</button>
+                </div>
+                <div class="device-confirm">
+                    <span>Delete this sensor? It will be unlinked from your account.</span>
+                    <button type="button" class="confirm-yes" onclick="deviceDeleteConfirmed(this)">Yes, delete</button>
+                    <button type="button" onclick="deviceDeleteCancel(this)">Cancel</button>
+                </div>
+                <?php if ($dev['has_reading']): ?>
+                <div class="footer">
+                    <span><?php echo $dev['timestamp']; ?></span>
+                    <span><?php echo $dev['source_ip']; ?></span>
+                </div>
+                <?php endif; ?>
             </div>
 
-            <div class="reading">
-                <div class="label">Pressure</div>
-                <div class="value"><?php echo $press_val; ?><span class="unit">hPa</span></div>
-            </div>
+            <?php if (!$dev['has_reading']): ?>
+                <div class="empty-state">Device has been added, now waiting for data - this may take ~15 minutes.</div>
+            <?php else: ?>
+                <div class="grid">
+                    <div class="reading">
+                        <div class="label">Temperature</div>
+                        <div class="value"><?php echo $dev['temp_val']; ?><span class="unit">&deg;C</span></div>
+                    </div>
 
-            <div class="reading">
-                <div class="label">Humidity</div>
-                <div class="value"><?php echo $hum_val; ?><span class="unit">%</span></div>
-            </div>
+                    <div class="reading">
+                        <div class="label">Pressure</div>
+                        <div class="value"><?php echo $dev['press_val']; ?><span class="unit">hPa</span></div>
+                    </div>
 
-            <div class="reading battery">
-                <div class="label">Battery/Signal</div>
-                <div class="value<?php echo $batt_class; ?>"><?php echo $batt_val; ?>mV<?php if ($wifi_val !== ''): ?>/<?php echo htmlspecialchars($wifi_val); ?><?php endif; ?></div>
-            </div>
-        </div>
+                    <div class="reading">
+                        <div class="label">Humidity</div>
+                        <div class="value"><?php echo $dev['hum_val']; ?><span class="unit">%</span></div>
+                    </div>
 
-        <div class="devices">
-            <div class="devices-title">Device</div>
-            <div class="device-row">
-                <span class="device-number"><?php echo htmlspecialchars($device['device_number']); ?></span>
-                <span class="device-created">Added <?php echo htmlspecialchars($device['created_at']); ?></span>
-            </div>
-        </div>
-
-        <div class="footer">
-            <span><?php echo $timestamp; ?></span>
-            <span><?php echo $source_ip; ?></span>
-        </div>
+                    <div class="reading battery">
+                        <div class="label">Battery/Signal</div>
+                        <div class="value<?php echo $dev['batt_class']; ?>"><?php echo $dev['batt_val']; ?>mV<?php if ($dev['wifi_val'] !== ''): ?>/<?php echo htmlspecialchars($dev['wifi_val']); ?><?php endif; ?></div>
+                    </div>
+                </div>
+            <?php endif; ?>
+        <?php endforeach; ?>
     <?php endif; ?>
+
+    <?php /* mobile-only scroll room past the "Add sensor" button, which the */
+          /* Android app overlays on top of this page - see .mobile-scroll- */
+          /* spacer below (hidden on desktop, shown under the same mobile */
+          /* breakpoint the rest of the page's responsive styles use) */ ?>
+    <div class="mobile-scroll-spacer">
+        <?php for ($i = 0; $i < 10; $i++): ?>
+        <div>&nbsp;</div>
+        <?php endfor; ?>
+    </div>
+
+    <script>
+    /* Plain inline confirm UI instead of window.confirm()/alert() - the */
+    /* Android app's WebView has no WebChromeClient installed, which makes */
+    /* native JS dialogs silently no-op (confirm() returns false right */
+    /* away) instead of showing anything, so this has to be pure DOM/CSS */
+    /* to work the same way in a browser and inside the app. */
+    /* An account can own multiple devices, each rendered as its own */
+    /* ".devices" box, so these all resolve the confirm bar/device number */
+    /* relative to the clicked button's own box rather than a fixed id. */
+    function deviceDeleteShowConfirm(button) {
+        var box = button.closest('.devices');
+        var confirmBar = box && box.querySelector('.device-confirm');
+        if (confirmBar) { confirmBar.classList.add('open'); }
+    }
+
+    function deviceDeleteCancel(button) {
+        var box = button.closest('.devices');
+        var confirmBar = box && box.querySelector('.device-confirm');
+        if (confirmBar) { confirmBar.classList.remove('open'); }
+    }
+
+    function deviceDeleteConfirmed(button) {
+        var box = button.closest('.devices');
+        var deviceNumber = box && box.getAttribute('data-device-number');
+        if (!deviceNumber) { return; }
+
+        button.disabled = true;
+        fetch('delete_device.php', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'device_number=' + encodeURIComponent(deviceNumber)
+        })
+            .then(function (r) { return r.text(); })
+            .then(function (text) {
+                if (text.trim() === 'OK') {
+                    location.reload();
+                } else {
+                    button.disabled = false;
+                    deviceDeleteCancel(button);
+                }
+            })
+            .catch(function () {
+                button.disabled = false;
+                deviceDeleteCancel(button);
+            });
+    }
+    </script>
 
 </body>
 </html>
