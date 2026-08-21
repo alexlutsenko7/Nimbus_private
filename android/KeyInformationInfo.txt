@@ -1,0 +1,4 @@
+Key store path
+C:\work\My\ProjectBookXWeather\AndroidApp\key\ProjetcBookXWeather
+
+Key password: Rehbwf_alxlabs_12

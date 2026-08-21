@@ -1308,7 +1308,7 @@ fun AppScreen(
                     Spacer(modifier = Modifier.height(16.dp))
                     /* Main error message */
                     Text(
-                        "No internet connection",
+                        "Loading data",
                         color = Color(0xFFE6EDF3),
                         fontSize = 18.sp
                     )
@@ -1316,7 +1316,7 @@ fun AppScreen(
                     Spacer(modifier = Modifier.height(8.dp))
                     /* Subtitle indicating automatic retry */
                     Text(
-                        "Retrying automatically...",
+                        "***",
                         color = Color(0xFF7D8B99),
                         fontSize = 14.sp
                     )
